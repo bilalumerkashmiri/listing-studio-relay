@@ -301,10 +301,11 @@
     S.email = d.email;
     S.storeName = d.store.name;
     if (d.store.id) S.storeId = d.store.id;
-    S.caps = d.caps || {};
-    S.stores = d.stores || [];
-    S.sheetUrl = d.sheetUrl || '';
-    S.memberCount = d.memberCount || 0;
+    // mutation responses carry records/counts only; keep the admin extras from the last full getState
+    if (d.caps) S.caps = d.caps; else if (!S.caps) S.caps = {};
+    if (d.stores) S.stores = d.stores; else if (!S.stores) S.stores = [];
+    if (d.caps || d.sheetUrl !== undefined) S.sheetUrl = d.sheetUrl || ''; else if (S.sheetUrl === undefined) S.sheetUrl = '';
+    if (d.memberCount !== undefined) S.memberCount = d.memberCount; else if (S.memberCount === undefined) S.memberCount = 0;
     document.body.classList.remove('no-store');
     S.rev = d.rev;
     // drop UI state for records that no longer exist

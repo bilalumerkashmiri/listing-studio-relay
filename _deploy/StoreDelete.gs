@@ -190,3 +190,11 @@ function restoreDeletedStore(storeId) {
     return { id: storeId, name: meta.name };
   });
 }
+
+
+/** Owner-only, run once from the editor: triggers the Google Drive consent screen that store deletion needs (moving a sheet to Trash). Changes nothing. */
+function authorizeDriveAccess() {
+  assertOwnerCaller_();
+  DriveApp.getRootFolder().getId();
+  return "Drive access authorized";
+}
