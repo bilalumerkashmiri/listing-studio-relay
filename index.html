@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer"><title>Signing in…</title>
+<style>body{font:16px system-ui,sans-serif;display:grid;place-items:center;height:100vh;margin:0;background:#f4f5f2;color:#1f3a30}</style></head>
+<body><p id="m">Signing you in…</p>
+<script>
+/* Listing Studio sign-in relay. Holds no secrets. Forwards ONLY the OAuth result
+   (code, state, error) to ONE fixed address and drops everything else (notably ?authuser=). */
+(function () {
+  var TARGET = 'https://script.google.com/macros/s/AKfycbyhqvk6813zjJETFqnzuONFCj5450MXsHclPBo8WmJGFhd5sZPXr9WMdpk2Dmp57vkJuA/exec';
+  var src = new URLSearchParams(location.search), out = [];
+  ['code', 'state', 'error'].forEach(function (k) {
+    var v = src.get(k);
+    if (v && v.length <= 4096) out.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+  });
+  if (!out.length) { document.getElementById('m').textContent = 'Nothing to forward.'; return; }
+  location.replace(TARGET + '?' + out.join('&'));
+})();
+</script></body></html>
