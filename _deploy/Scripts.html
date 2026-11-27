@@ -1,0 +1,2016 @@
+<script>
+(function () {
+  'use strict';
+
+  /* ============================================================
+   * Listing Studio V5 — client. No secrets, no trust: the server
+   * re-checks identity, role, store, record and data on EVERY call.
+   * All dynamic text is inserted with textContent (never innerHTML).
+   * innerHTML is used only for the constant SVG icon strings below.
+   * ============================================================ */
+
+  var BOOT = window.__BOOT__ || {};
+  var MAX_BATCH = 500;
+  var POLL_MS = 25000;
+
+  var S = {
+    token: '', role: '', email: '', storeName: 'Listing Studio', rev: -1,
+    storeId: BOOT.storeId || '', stores: [], caps: {}, sheetUrl: '',
+    records: [], counts: { total: 0, completed: 0, remaining: 0, errors: 0 },
+    filter: 'all', query: '', showTs: false,
+    expanded: {}, drafts: {}, pending: {}, editing: '', focusId: '', flashId: '',
+    extraRows: 2, inflight: 0, notice: BOOT.notice || '', memberCount: 0
+  };
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* ---------------- icons (constant, trusted strings) ---------------- */
+  function svg(inner, size, sw) {
+    return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="' + (sw || 1.75) +
+      '" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + inner + '</svg>';
+  }
+  var ICON = {
+    total: svg('<path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="m3 12.5 9 5 9-5"/><path d="m3 17 9 5 9-5"/>', 15),
+    done: svg('<circle cx="12" cy="12" r="9"/><path d="m8.5 12.5 2.5 2.5 4.5-5"/>', 15),
+    remaining: svg('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>', 15),
+    errors: svg('<path d="M12 3.5 2.5 20h19L12 3.5Z"/><path d="M12 10v4.5M12 17.5v.01"/>', 15),
+    alert: svg('<path d="M12 3.5 2.5 20h19L12 3.5Z"/><path d="M12 10v4.5M12 17.5v.01"/>', 22),
+    ext: svg('<path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>', 13, 2),
+    note: svg('<path d="M5 4h14a1 1 0 0 1 1 1v9l-6 6H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Z"/><path d="M14 20v-5a1 1 0 0 1 1-1h5"/>', 16),
+    chev: svg('<path d="m6 9 6 6 6-6"/>', 16, 2),
+    dots: '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5.5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="18.5" r="1.7"/></svg>',
+    trash: svg('<path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="m6 7 1 13h10l1-13"/><path d="M10 11v6M14 11v6"/>', 15),
+    pencil: svg('<path d="M4 20h4L19 9l-4-4L4 16v4Z"/><path d="m13.5 6.5 4 4"/>', 14),
+    check: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#21864E" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>'
+  };
+
+  /* ---------------- tiny DOM helper ---------------- */
+  function el(tag, props, kids) {
+    var n = document.createElement(tag);
+    if (props) {
+      for (var k in props) {
+        if (!Object.prototype.hasOwnProperty.call(props, k)) continue;
+        var v = props[k];
+        if (v === null || v === undefined || v === false) continue;
+        if (k === 'class') n.className = v;
+        else if (k === 'text') n.textContent = v;
+        else if (k === 'icon') n.insertAdjacentHTML('afterbegin', v); // constant SVG only
+        else if (k.slice(0, 2) === 'on') n.addEventListener(k.slice(2), v);
+        else n.setAttribute(k, v === true ? '' : String(v));
+      }
+    }
+    (kids || []).forEach(function (c) {
+      if (c === null || c === undefined) return;
+      n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    });
+    return n;
+  }
+  function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+  function debounce(fn, ms) { var t; return function () { var a = arguments; clearTimeout(t); t = setTimeout(function () { fn.apply(null, a); }, ms); }; }
+  function isAdmin() { return S.role === 'admin'; }
+
+  /* ---------------- client-side URL check (UX only; server is authoritative) ---------------- */
+  var ALLOWED_HOSTS = ['etsy.com', 'www.etsy.com'];
+  var LISTING_ID_RE = /^[1-9][0-9]{4,14}$/;
+  var LOCALE_RE = /^[a-z]{2}(?:-[a-z]{2})?$/i;
+  function parseEtsy(raw) {
+    function fail(code) { return { ok: false, code: code }; }
+    if (raw === null || raw === undefined) return fail('EMPTY');
+    var s = String(raw).trim();
+    if (!s) return fail('EMPTY');
+    if (s.length > 2048) return fail('TOO_LONG');
+    if (/[\s\u0000-\u001f\u007f\\]/.test(s)) return fail('MALFORMED');
+    var rest, m = /^([a-z][a-z0-9+.\-]*):\/\//i.exec(s);
+    if (m) {
+      var sc = m[1].toLowerCase();
+      if (sc !== 'https' && sc !== 'http') return fail('SCHEME');
+      rest = s.slice(m[0].length);
+    } else if (/^[a-z][a-z0-9+.\-]*:/i.test(s)) { return fail('SCHEME'); }
+    else { rest = s; }
+    var cut = rest.search(/[\/?#]/);
+    var auth = cut === -1 ? rest : rest.slice(0, cut);
+    var tail = cut === -1 ? '' : rest.slice(cut);
+    if (!auth) return fail('MALFORMED');
+    if (auth.indexOf('@') !== -1) return fail('HOST');
+    var hm = /^([a-z0-9.\-]+)(?::(\d{1,5}))?$/i.exec(auth);
+    if (!hm) return fail('MALFORMED');
+    if (hm[2] !== undefined && hm[2] !== '443' && hm[2] !== '80') return fail('HOST');
+    if (ALLOWED_HOSTS.indexOf(hm[1].toLowerCase()) === -1) return fail('HOST');
+    var path = tail.split(/[?#]/)[0];
+    if (path.charAt(0) !== '/') return fail('NOT_LISTING');
+    var segs = path.split('/').filter(function (x) { return x.length > 0; });
+    if (segs.length && LOCALE_RE.test(segs[0])) segs.shift();
+    if (!segs.length || segs[0].toLowerCase() !== 'listing') return fail('NOT_LISTING');
+    if (segs.length < 2) return fail('BAD_ID');
+    if (segs.length > 3) return fail('NOT_LISTING');
+    if (!LISTING_ID_RE.test(segs[1])) return fail('BAD_ID');
+    return { ok: true, listingId: segs[1] };
+  }
+  window.__parseEtsyClient = parseEtsy; // exposed for automated tests only
+
+  function safeHref(u) { return /^https:\/\/www\.etsy\.com\/listing\/[0-9]{1,15}$/.test(u || '') ? u : ''; }
+
+  /* ---------------- server calls ---------------- */
+  function rpc(req) {
+    return new Promise(function (resolve) {
+      try {
+        google.script.run
+          .withSuccessHandler(function (r) { resolve(r || { ok: false, code: 'SERVER', message: 'No response from the server.' }); })
+          .withFailureHandler(function () { resolve({ ok: false, code: 'NETWORK', message: 'Could not reach the server. Check your connection and try again.' }); })
+          .api(S.token, req);
+      } catch (e) {
+        resolve({ ok: false, code: 'NETWORK', message: 'Could not reach the server. Check your connection and try again.' });
+      }
+    });
+  }
+
+  function call(action, payload, quiet) {
+    if (!quiet) setSaving(1);
+    return rpc({ action: action, storeId: S.storeId, payload: payload || {} }).then(function (r) {
+      if (!quiet) setSaving(-1);
+      return r;
+    });
+  }
+
+  /** Account-level actions (no store in the request): sign out, store list, create store. */
+  function callGlobal(action, payload, quiet) {
+    if (!quiet) setSaving(1);
+    return rpc({ action: action, payload: payload || {} }).then(function (r) {
+      if (!quiet) setSaving(-1);
+      return r;
+    });
+  }
+
+  function setSaving(d) {
+    S.inflight = Math.max(0, S.inflight + d);
+    var n = $('saving');
+    if (n) n.hidden = S.inflight === 0;
+  }
+
+  function fail(r) {
+    if (r.code === 'AUTH_REQUIRED') { gateSignIn(S.token ? 'Your session has ended. Please sign in again.' : r.message); return; }
+    if (r.code === 'DENIED') { handleRevoked(r); return; }
+    toast(r.message || 'Something went wrong. Please try again.', true);
+  }
+
+  /* ---------------- gate / toast / modal ---------------- */
+  function showGate(title, text, mode) {
+    // mode: true / 'signin' = sign-in button; 'denied' = account switcher; anything else = message only
+    var m = mode === true ? 'signin' : (mode || 'none');
+    $('app').hidden = true;
+    $('gate').hidden = false;
+    $('gateTitle').textContent = title;
+    $('gateText').textContent = text || '';
+    var canLogin = BOOT.authMode === 'SESSION' && BOOT.loginEnabled;
+    $('gateLink').hidden = (m !== 'signin' && m !== 'denied') || (m === 'denied' && !canLogin);
+    $('gateLink').textContent = m === 'denied' ? 'Use another Google account' : 'Sign in with Google';
+    $('gateLink').disabled = false;
+    $('gateRetry').hidden = m !== 'denied';
+    $('gateSignOut').hidden = m !== 'denied' || !canLogin;
+    $('gateRetry').disabled = false;
+    $('gateSignOut').disabled = false;
+  }
+  function gateSignIn(msg) {
+    if (BOOT.authMode === 'SESSION' && BOOT.loginEnabled) {
+      showGate('Sign in to continue', S.notice || msg || 'Use your Google account to open this tracker.', true);
+    } else if (BOOT.authMode === 'SESSION') {
+      showGate('Sign-in unavailable', 'Sign-in is not configured for this tracker yet. Please contact the store owner.');
+    } else {
+      showGate('Sign in required', 'Open this tracker while signed in to your Google Workspace account.');
+    }
+  }
+
+  /* ---- browser-bound sign-in: the secret verifier never leaves this browser ---- */
+  var VKEY = 'ls_login_verifier';
+  function b64url(buf) {
+    var s = '', a = new Uint8Array(buf);
+    for (var i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  function storeVerifier(v) {
+    try { localStorage.setItem(VKEY, v); return true; } catch (e) { /* try next */ }
+    try { sessionStorage.setItem(VKEY, v); return true; } catch (e2) { return false; }
+  }
+  function readVerifier() {
+    try { var v = localStorage.getItem(VKEY); if (v) return v; } catch (e) { /* try next */ }
+    try { return sessionStorage.getItem(VKEY) || ''; } catch (e2) { return ''; }
+  }
+  function clearVerifier() {
+    try { localStorage.removeItem(VKEY); } catch (e) { /* ignore */ }
+    try { sessionStorage.removeItem(VKEY); } catch (e2) { /* ignore */ }
+  }
+  function beginLogin() {
+    var btn = $('gateLink');
+    if (!(window.crypto && crypto.subtle && crypto.getRandomValues)) {
+      showGate('Sign-in unavailable', 'This browser cannot sign in securely. Please use a current version of Chrome, Edge, Safari or Firefox.');
+      return;
+    }
+    var rnd = new Uint8Array(32); crypto.getRandomValues(rnd);
+    var verifier = b64url(rnd);
+    if (!storeVerifier(verifier)) {
+      showGate('Sign-in unavailable', 'Your browser is blocking site storage, which is needed to sign in securely. Allow storage for this page and try again.');
+      return;
+    }
+    btn.disabled = true;
+    crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)).then(function (d) {
+      return call('startLogin', { challenge: b64url(d) }, true);
+    }).then(function (r) {
+      if (!r.ok) { btn.disabled = false; clearVerifier(); toast(r.message || 'Sign-in is not available right now.', true); return; }
+      try { window.top.location.href = r.data.authUrl; } catch (e) { window.open(r.data.authUrl, '_top'); }
+    });
+  }
+  /** Ends this person's sessions on the server (all browsers) and in this page. */
+  function signOut() {
+    var b = $('gateSignOut'); b.disabled = true;
+    return callGlobal('signOut', {}, true).then(function () {
+      S.token = '';
+      try { sessionStorage.removeItem('ls_tok_' + BOOT.storeId); } catch (e) { /* ignore */ }
+      clearVerifier();
+      firstLoaded = false;
+      S.notice = '';
+      showGate('Signed out', 'You have been signed out of Listing Studio.', BOOT.authMode === 'SESSION' && BOOT.loginEnabled ? 'signin' : 'none');
+    });
+  }
+  function tryAgain() {
+    var b = $('gateRetry'); b.disabled = true;
+    loadState(true).then(function (okay) { if (!okay) b.disabled = false; });
+  }
+
+  function redeemPending() {
+    var v = readVerifier();
+    if (!v) { S.notice = 'Sign-in could not be completed in this browser. Please sign in again.'; gateSignIn(); return; }
+    call('redeemLogin', { pending: BOOT.pending, verifier: v }, true).then(function (r) {
+      clearVerifier();
+      if (!r.ok) { S.notice = r.message || 'Sign-in could not be completed. Please sign in again.'; gateSignIn(); return; }
+      S.token = r.data.token;
+      try { sessionStorage.setItem('ls_tok_' + BOOT.storeId, S.token); } catch (e) { /* storage unavailable: fine */ }
+      loadState(true);
+    });
+  }
+
+  var toastTimer;
+  function toast(msg, isError) {
+    var t = $('toast');
+    t.textContent = msg;
+    t.className = 'toast' + (isError ? ' error' : '');
+    t.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.hidden = true; }, isError ? 6500 : 3500);
+  }
+
+  function confirmDialog(title, text, okLabel, neutral) {
+    return new Promise(function (resolve) {
+      var m = $('modal');
+      $('modalTitle').textContent = title;
+      $('modalText').textContent = text;
+      $('modalOk').textContent = okLabel || 'Confirm';
+      $('modalOk').className = 'btn ' + (neutral ? 'btn-primary' : 'btn-danger');
+      m.hidden = false;
+      var prev = document.activeElement;
+      function done(v) {
+        m.hidden = true;
+        $('modalOk').removeEventListener('click', ok);
+        $('modalCancel').removeEventListener('click', no);
+        document.removeEventListener('keydown', key, true);
+        if (prev && prev.focus) { try { prev.focus(); } catch (e) { /* element gone */ } }
+        resolve(v);
+      }
+      function ok() { done(true); }
+      function no() { done(false); }
+      function key(e) { if (e.key === 'Escape') { e.preventDefault(); done(false); } }
+      $('modalOk').addEventListener('click', ok);
+      $('modalCancel').addEventListener('click', no);
+      document.addEventListener('keydown', key, true);
+      $('modalCancel').focus();
+    });
+  }
+
+  /* ---------------- state ---------------- */
+  function recount() {
+    var c = { total: 0, completed: 0, remaining: 0, errors: 0 };
+    S.records.forEach(function (r) {
+      if (r.status === 'VALID') { c.total++; if (r.done) c.completed++; else c.remaining++; }
+      else c.errors++;
+    });
+    S.counts = c;
+  }
+
+  function setState(d) {
+    S.records = d.records || [];
+    S.role = d.role;
+    S.email = d.email;
+    S.storeName = d.store.name;
+    if (d.store.id) S.storeId = d.store.id;
+    // mutation responses carry records/counts only; keep the admin extras from the last full getState
+    if (d.caps) S.caps = d.caps; else if (!S.caps) S.caps = {};
+    if (d.stores) S.stores = d.stores; else if (!S.stores) S.stores = [];
+    if (d.caps || d.sheetUrl !== undefined) S.sheetUrl = d.sheetUrl || ''; else if (S.sheetUrl === undefined) S.sheetUrl = '';
+    if (d.memberCount !== undefined) S.memberCount = d.memberCount; else if (S.memberCount === undefined) S.memberCount = 0;
+    // The Etsy shop link only arrives for administrators of THIS store, in a full state (never in a mutation response).
+    if (d.caps) S.etsyUrl = (d.role === 'admin' && typeof d.etsyStoreUrl === 'string') ? d.etsyStoreUrl : '';
+    document.body.classList.remove('no-store');
+    S.rev = d.rev;
+    // drop UI state for records that no longer exist
+    var ids = {};
+    S.records.forEach(function (r) { ids[r.id] = true; });
+    [S.expanded, S.drafts, S.pending].forEach(function (o) { Object.keys(o).forEach(function (k) { if (!ids[k]) delete o[k]; }); });
+    if (S.editing && !ids[S.editing]) S.editing = '';
+    if (S.filter === 'errors' && !isAdmin()) S.filter = 'all';
+    recount();
+    render();
+    renderSwitcher();
+  }
+
+  function loadState(initial) {
+    return call('getState', {}, !initial).then(function (r) {
+      if (!r.ok) { if (initial) fail(r); return false; }
+      if (initial) onFirstLoad(true);
+      setState(r.data);
+      return true;
+    });
+  }
+
+  var firstLoaded = false;
+  function onFirstLoad(force) {
+    if (firstLoaded && !force) return;
+    firstLoaded = true;
+    $('gate').hidden = true;
+    $('app').hidden = false;
+  }
+
+  /* ---------------- derived views ---------------- */
+  function visible() {
+    var q = S.query.trim().toLowerCase();
+    return S.records.filter(function (r) {
+      var err = r.status !== 'VALID';
+      if (S.filter === 'remaining' && (err || r.done)) return false;
+      if (S.filter === 'done' && (err || !r.done)) return false;
+      if (S.filter === 'errors' && !err) return false;
+      if (S.dateFilter && S.dateFilter !== 'all' && isAdmin()) {
+        if (err || !r.addedDay || r.addedDay !== karachiDay(S.dateFilter === 'yesterday' ? 1 : 0)) return false;
+      }
+      if (q) {
+        var hay = (r.listingId + ' ' + r.url + ' ' + (r.notes || '')).toLowerCase();
+        if (hay.indexOf(q) === -1) return false;
+      }
+      return true;
+    });
+  }
+
+  /** Calendar day (yyyy-mm-dd) in Asia/Karachi, `back` days ago. Pure display filter: never changes data. */
+  function karachiDay(back) {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(Date.now() - back * 86400000));
+  }
+
+  function errors() { return S.records.filter(function (r) { return r.status !== 'VALID'; }); }
+
+  /* ---------------- render ---------------- */
+  var appliedMode = null;
+  var detached = [];
+  function roleMode() { return isAdmin() ? 'admin' : (S.caps && S.caps.createStore ? 'team+create' : 'team'); }
+  function applyRole() {
+    var admin = isAdmin();
+    var mode = roleMode();
+    if (!adminBound) bindAdminControls();   // bind once while the nodes exist; listeners survive detaching
+    if (appliedMode !== mode) {
+      appliedMode = mode;
+      // put every previously removed control back (reverse order), then remove what this role must not have
+      for (var i = detached.length - 1; i >= 0; i--) { var d = detached[i]; if (d.marker.parentNode) d.marker.parentNode.replaceChild(d.node, d.marker); }
+      detached = [];
+      if (mode !== 'admin') {
+        // Team view: administrative controls are REMOVED from the DOM, not merely hidden.
+        // A team member who may create stores keeps only the gear + panel, whose store-settings and
+        // team sections are removed too; the Create-store section is all that remains.
+        var keep = mode === 'team+create' ? { settingsBtn: 1, settingsPanel: 1 } : {};
+        var nodes = Array.prototype.slice.call(document.querySelectorAll('.admin-only')).filter(function (n) { return !keep[n.id]; });
+        if (mode === 'team+create') ['tab_store', 'tab_team'].forEach(function (id) { var n = $(id); if (n) nodes.push(n); });
+        nodes.forEach(function (n) {
+          var marker = document.createComment('admin-only');
+          n.parentNode.replaceChild(marker, n);
+          detached.push({ node: n, marker: marker });
+        });
+      }
+    }
+    $('accessLabel').textContent = admin ? 'Administrator access' : 'Team access';
+  }
+
+  function render() {
+    var y = window.pageYOffset || 0;
+    applyRole();
+    renderHeader();
+    renderKpis();
+    renderProgress();
+    renderErrorPanel();
+    renderFilters();
+    renderTable();
+    window.scrollTo(0, y);
+  }
+
+  var ETSY_SHOP_RE = /^https:\/\/www\.etsy\.com\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?shop\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+  function renderHeader() {
+    $('storeName').textContent = S.storeName;
+    var eb = $('etsyBtn');   // exists only in the administrator DOM; always reflects the CURRENT store
+    if (eb) {
+      var u = isAdmin() && S.etsyUrl && ETSY_SHOP_RE.test(S.etsyUrl) ? S.etsyUrl : '';
+      eb.hidden = !u;
+      if (u) eb.setAttribute('href', u); else eb.removeAttribute('href');
+    }
+    document.title = S.storeName + ' · Listing Studio';
+  }
+
+  function renderKpis() {
+    var box = $('kpis');
+    clear(box);
+    box.className = 'kpis' + (isAdmin() ? '' : ' three');
+    var defs = [
+      { key: 'total', label: 'Total listings', icon: ICON.total, filter: 'all', val: S.counts.total },
+      { key: 'completed', label: 'Completed', icon: ICON.done, filter: 'done', val: S.counts.completed, cls: 'good' },
+      { key: 'remaining', label: 'Remaining', icon: ICON.remaining, filter: 'remaining', val: S.counts.remaining }
+    ];
+    if (isAdmin()) defs.push({ key: 'errors', label: 'Errors', icon: ICON.errors, filter: 'errors', val: S.counts.errors, cls: S.counts.errors > 0 ? 'bad' : '' });
+    defs.forEach(function (d) {
+      var b = el('button', {
+        type: 'button', class: 'kpi' + (S.filter === d.filter && S.filter !== 'all' ? ' active' : ''), 'data-kpi': d.key,
+        'aria-label': d.label + ': ' + d.val + '. Show ' + d.label.toLowerCase(),
+        onclick: function () { S.filter = d.filter; renderKpis(); renderFilters(); renderTable(); }
+      }, [
+        el('div', { class: 'kpi-top' }, [el('span', { icon: d.icon }), el('span', { text: d.label })]),
+        el('div', { class: 'kpi-value ' + (d.cls || ''), text: String(d.val) })
+      ]);
+      box.appendChild(b);
+    });
+  }
+
+  function renderProgress() {
+    var c = S.counts;
+    var pct = c.total > 0 ? Math.min(100, Math.max(0, Math.round((c.completed / c.total) * 100))) : 0;
+    $('pct').textContent = pct + '%';
+    $('barFill').style.width = pct + '%';
+    $('bar').setAttribute('aria-valuenow', String(pct));
+    $('progressText').textContent = c.completed + ' of ' + c.total + ' unique listings completed';
+  }
+
+  function renderFilters() {
+    var box = $('filters');
+    clear(box);
+    var defs = [['all', 'All'], ['remaining', 'Remaining'], ['done', 'Done']];
+    if (isAdmin()) defs.push(['errors', 'Errors']);
+    defs.forEach(function (d) {
+      box.appendChild(el('button', {
+        type: 'button', class: 'seg', 'data-filter': d[0], 'aria-pressed': S.filter === d[0] ? 'true' : 'false', text: d[1],
+        onclick: function () { S.filter = d[0]; renderKpis(); renderFilters(); renderTable(); }
+      }));
+    });
+  }
+
+  function renderErrorPanel() {
+    var p = $('errorPanel');
+    if (!p) return;
+    var errs = errors();
+    if (!errs.length) { p.hidden = true; clear(p); return; }
+    var cur = null;
+    errs.forEach(function (r) { if (r.id === S.focusId) cur = r; });
+    if (!cur) cur = errs[errs.length - 1];
+    var e = cur.error || {};
+    clear(p);
+    var body = el('div', { class: 'error-body' }, [
+      el('h2', { class: 'error-head', text: e.heading || 'Problem with this entry' }),
+      el('p', { class: 'error-msg', text: e.message || '' })
+    ]);
+    if (e.kind === 'duplicate') body.appendChild(el('p', { class: 'error-meta', text: 'Original listing: ' + e.originalState }));
+    var actions = el('div', { class: 'error-actions' });
+    if (e.kind === 'duplicate') {
+      actions.appendChild(el('button', { type: 'button', class: 'btn btn-sm btn-err', 'data-act': 'find', text: 'Find original listing', onclick: function () { findOriginal(e.originalId); } }));
+    }
+    actions.appendChild(el('button', { type: 'button', class: 'btn btn-sm btn-err', 'data-act': 'clear', text: 'Clear invalid entry', onclick: function () { clearEntry(cur); } }));
+    body.appendChild(actions);
+    if (errs.length > 1) {
+      var others = errs.length - 1;
+      body.appendChild(el('p', { class: 'error-more' }, [
+        others + (others === 1 ? ' other entry needs' : ' other entries need') + ' attention. ',
+        el('button', { type: 'button', class: 'linklike', text: 'View all errors', onclick: function () { S.filter = 'errors'; renderKpis(); renderFilters(); renderTable(); } })
+      ]));
+    }
+    p.appendChild(el('span', { class: 'error-icon', icon: ICON.alert }));
+    p.appendChild(body);
+    p.hidden = false;
+  }
+
+  function findOriginal(id) {
+    S.filter = 'all'; S.query = ''; $('search').value = '';
+    S.flashId = id;
+    renderKpis(); renderFilters(); renderTable();
+    var row = document.querySelector('tr[data-id="' + id + '"]');
+    if (row && row.scrollIntoView) row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  /* ---------------- table ---------------- */
+  function thead() {
+    var h = $('thead');
+    clear(h);
+    var cols = [['#', 'col-n c'], ['Etsy Listing Link', 'col-link'], ['Listing ID', 'col-id'], ['Open', 'col-open c'], ['Notes', 'col-notes'], ['Images Done', 'col-done c']];
+    if (isAdmin() && S.showTs) { cols.push(['Date Added', 'col-ts']); cols.push(['Date Completed', 'col-ts']); }
+    if (isAdmin()) cols.push(['Actions', 'col-act c']);   // V5.2: never rendered for team members
+    $('table').classList.toggle('has-act', isAdmin());
+    var tr = el('tr');
+    cols.forEach(function (c) { tr.appendChild(el('th', { scope: 'col', class: c[1], text: c[0] })); });
+    h.appendChild(tr);
+    return cols.length;
+  }
+
+  function renderTable() {
+    closeMenu();
+    var ncols = thead();
+    var body = $('tbody');
+    clear(body);
+    var rows = visible();
+    rows.forEach(function (r) {
+      body.appendChild(r.status === 'VALID' ? validRow(r) : errorRow(r));
+      if (S.expanded[r.id] && r.status === 'VALID') body.appendChild(notesRow(r, ncols));
+    });
+    var mc = $('matchCount');
+    if (mc) { var dated = isAdmin() && S.dateFilter && S.dateFilter !== 'all'; mc.hidden = !dated; if (dated) mc.textContent = rows.length + (rows.length === 1 ? ' matching record' : ' matching records'); }
+    var showBlank = isAdmin() && S.filter === 'all' && !S.query.trim() && (!S.dateFilter || S.dateFilter === 'all');
+    if (showBlank) for (var i = 0; i < S.extraRows; i++) body.appendChild(blankRow(i));
+
+    var msg = $('emptyMsg');
+    if (!rows.length && !showBlank) {
+      msg.hidden = false;
+      msg.textContent = S.records.length ? 'No listings match this view.' : 'No listings yet.';
+    } else if (!rows.length && showBlank && !S.records.length) {
+      msg.hidden = false;
+      msg.textContent = 'No listings yet. Paste an Etsy link into the first row, or use “Add listings”.';
+    } else {
+      msg.hidden = true;
+    }
+    if (S.flashId) {
+      var f = body.querySelector('tr[data-id="' + S.flashId + '"]');
+      if (f) f.classList.add('flash');
+      S.flashId = '';
+    }
+  }
+
+  function numCell(r) { return el('td', { class: 'num', text: r ? String(r.n) : '' }); }
+
+  function linkCell(r) {
+    var td = el('td');
+    var wrap = el('div', { class: 'link-cell' });
+    var href = safeHref(r.canonicalUrl);
+    if (isAdmin() && S.editing === r.id) {
+      wrap.appendChild(urlInput(r, 'Edit Etsy listing link'));
+    } else {
+      wrap.appendChild(href
+        ? el('a', { href: href, target: '_blank', rel: 'noopener noreferrer', title: r.url, text: r.url })
+        : el('span', { text: r.url }));
+      if (isAdmin()) wrap.appendChild(el('button', {
+        type: 'button', class: 'edit-btn', 'aria-label': 'Edit link for listing ' + r.listingId, icon: ICON.pencil,
+        onclick: function () { S.editing = r.id; renderTable(); var i = document.querySelector('tr[data-id="' + r.id + '"] input'); if (i) { i.focus(); i.select(); } }
+      }));
+    }
+    td.appendChild(wrap);
+    return td;
+  }
+
+  function urlInput(r, label) {
+    var committed = false;
+    var inp = el('input', {
+      type: 'text', class: 'input', value: r.url, 'aria-label': label, spellcheck: 'false', autocomplete: 'off',
+      onkeydown: function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); inp.blur(); }
+        else if (e.key === 'Escape') { committed = true; S.editing = ''; renderTable(); }
+      },
+      onchange: function () { committed = true; submitUrlEdit(r, inp.value, false); },
+      onblur: function () { if (!committed && S.editing === r.id && r.status === 'VALID') { S.editing = ''; renderTable(); } }
+    });
+    inp.value = r.url;
+    return inp;
+  }
+
+  function openCell(r) {
+    var td = el('td', { class: 'c' });
+    var href = safeHref(r.canonicalUrl);
+    if (href) td.appendChild(el('a', { class: 'btn-open', href: href, target: '_blank', rel: 'noopener noreferrer', 'aria-label': 'Open listing ' + r.listingId + ' on Etsy' }, [
+      el('span', { icon: ICON.ext }), 'Open'
+    ]));
+    return td;
+  }
+
+  function notesCell(r) {
+    var td = el('td');
+    var has = !!(r.notes && r.notes.trim());
+    var label = has ? r.notes.replace(/\s+/g, ' ').trim() : (isAdmin() ? 'Add note' : 'No notes');
+    td.appendChild(el('button', {
+      type: 'button', class: 'notes-btn', 'aria-expanded': S.expanded[r.id] ? 'true' : 'false', 'data-notes': r.id,
+      'aria-label': 'Notes for listing ' + r.listingId + ': ' + label,
+      onclick: function () { if (S.expanded[r.id]) delete S.expanded[r.id]; else S.expanded[r.id] = true; renderTable(); if (S.expanded[r.id]) { var t = document.querySelector('tr.notes-row[data-for="' + r.id + '"] textarea'); if (t) t.focus(); } }
+    }, [
+      el('span', { icon: ICON.note }),
+      el('span', { class: 'prev' + (has ? '' : ' empty'), text: label }),
+      el('span', { class: 'chev', icon: ICON.chev })
+    ]));
+    return td;
+  }
+
+  function switchCell(r) {
+    var td = el('td', { class: 'c' });
+    var on = !!r.done;
+    var wrap = el('div', { class: 'switch-wrap' });
+    var sw = el('button', {
+      type: 'button', class: 'switch', role: 'switch', 'aria-checked': on ? 'true' : 'false',
+      'aria-label': 'Images done for listing ' + r.listingId, 'data-switch': r.id,
+      onclick: function () { onToggle(r, sw); }
+    }, [el('span', { class: 'knob', icon: ICON.check })]);
+    if (S.pending[r.id]) { sw.disabled = true; sw.setAttribute('aria-busy', 'true'); }
+    wrap.appendChild(sw);
+    wrap.appendChild(el('span', { class: 'switch-state', text: on ? 'DONE' : 'OFF' }));
+    td.appendChild(wrap);
+    return td;
+  }
+
+  function tsCells(tr, r) {
+    if (isAdmin() && S.showTs) {
+      tr.appendChild(el('td', null, [el('span', { class: 'ts', text: r.added || '' })]));
+      tr.appendChild(el('td', null, [el('span', { class: 'ts', text: r.completed || '' })]));
+    }
+  }
+
+  function validRow(r) {
+    var tr = el('tr', { class: 'row ' + (r.done ? 'done' : 'todo'), 'data-id': r.id, 'data-state': r.done ? 'done' : 'todo' });
+    tr.appendChild(numCell(r));
+    tr.appendChild(linkCell(r));
+    tr.appendChild(el('td', null, [el('span', { class: 'lid', text: r.listingId })]));
+    tr.appendChild(openCell(r));
+    tr.appendChild(notesCell(r));
+    tr.appendChild(switchCell(r));
+    tsCells(tr, r);
+    actCell(tr, r);
+    return tr;
+  }
+
+  function errorRow(r) {
+    var tr = el('tr', {
+      class: 'row err', 'data-id': r.id, 'data-state': 'error',
+      onclick: function (e) { if (e.target.closest('button,input,a')) return; S.focusId = r.id; renderErrorPanel(); }
+    });
+    tr.appendChild(numCell(r));
+    var linkTd = el('td');
+    linkTd.appendChild(el('div', { class: 'link-cell' }, [urlInput(r, 'Correct the Etsy listing link')]));
+    tr.appendChild(linkTd);
+    tr.appendChild(el('td', null, [el('span', { class: 'lid', text: r.listingId || '—' })]));
+    tr.appendChild(el('td', { class: 'c' }));
+    tr.appendChild(el('td', null, [el('span', { class: 'na', text: '—' })]));
+    var d = el('td', { class: 'c' });
+    d.appendChild(el('div', { class: 'err-cell' }, [
+      el('span', { class: 'err-tag', text: 'ERROR' }),
+      el('button', { type: 'button', class: 'btn btn-sm btn-err', 'data-act': 'clear-row', text: 'Clear', 'aria-label': 'Clear invalid entry', onclick: function () { clearEntry(r); } })
+    ]));
+    tr.appendChild(d);
+    tsCells(tr, { added: '', completed: '' });
+    actCell(tr, r);
+    return tr;
+  }
+
+  function blankRow(i) {
+    var tr = el('tr', { class: 'row blank', 'data-blank': String(i) });
+    tr.appendChild(el('td', { class: 'num' }));
+    var inp = el('input', {
+      type: 'text', class: 'input', placeholder: 'Paste an Etsy listing link…', 'aria-label': 'New Etsy listing link', spellcheck: 'false', autocomplete: 'off',
+      onpaste: function (e) {
+        var text = (e.clipboardData && e.clipboardData.getData('text')) || '';
+        if (!text.trim()) return;
+        e.preventDefault();
+        submitBlank(inp, text.split(/\r?\n/));
+      },
+      onkeydown: function (e) { if (e.key === 'Enter') { e.preventDefault(); if (inp.value.trim()) submitBlank(inp, [inp.value]); } },
+      onchange: function () { if (inp.value.trim()) submitBlank(inp, [inp.value]); }
+    });
+    tr.appendChild(el('td', null, [el('div', { class: 'link-cell' }, [inp])]));
+    for (var c = 0; c < 4; c++) tr.appendChild(el('td'));
+    if (isAdmin() && S.showTs) { tr.appendChild(el('td')); tr.appendChild(el('td')); }
+    if (isAdmin()) tr.appendChild(el('td'));
+    return tr;
+  }
+
+  function notesRow(r, ncols) {
+    var tr = el('tr', { class: 'notes-row', 'data-for': r.id });
+    var td = el('td', { colspan: String(ncols) });
+    td.appendChild(el('p', { class: 'np-head', text: 'Special instructions · ' + r.listingId }));
+    if (isAdmin()) {
+      var draft = Object.prototype.hasOwnProperty.call(S.drafts, r.id) ? S.drafts[r.id] : r.notes;
+      var ta = el('textarea', {
+        class: 'np-area', 'aria-label': 'Notes for listing ' + r.listingId, maxlength: '5000',
+        oninput: function () { S.drafts[r.id] = ta.value; }
+      });
+      ta.value = draft;
+      td.appendChild(ta);
+      td.appendChild(el('div', { class: 'np-actions' }, [
+        el('button', { type: 'button', class: 'btn btn-primary btn-sm', 'data-act': 'save-note', text: 'Save Note', onclick: function () { saveNote(r, ta.value); } }),
+        el('button', { type: 'button', class: 'btn btn-ghost btn-sm', text: 'Close', onclick: function () { delete S.drafts[r.id]; delete S.expanded[r.id]; renderTable(); } }),
+        el('span', { class: 'spacer' }),
+        el('button', { type: 'button', class: 'btn-link-danger', 'data-act': 'remove', text: 'Remove listing', onclick: function () { removeListing(r); } })
+      ]));
+    } else {
+      var has = r.notes && r.notes.trim();
+      td.appendChild(el('p', { class: 'note-text' + (has ? '' : ' empty'), text: has ? r.notes : 'No notes' }));
+      td.appendChild(el('div', { class: 'np-actions' }, [
+        el('button', { type: 'button', class: 'btn btn-ghost btn-sm', text: 'Close', onclick: function () { delete S.expanded[r.id]; renderTable(); } })
+      ]));
+    }
+    tr.appendChild(td);
+    return tr;
+  }
+
+  /* ---------------- actions ---------------- */
+  function onToggle(r, btn) {
+    if (S.pending[r.id]) return;
+    S.pending[r.id] = true;
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    var want = !r.done;
+    call('setDone', { recordId: r.id, done: want }).then(function (res) {
+      delete S.pending[r.id];
+      if (res.ok) {
+        var rec = res.data.record;
+        S.records = S.records.map(function (x) { return x.id === rec.id ? Object.assign({}, x, rec) : x; });
+        if (res.data.rev === S.rev + 1) S.rev = res.data.rev;
+        recount();
+        render();
+      } else {
+        fail(res);
+        if (res.code === 'NOT_FOUND' || res.code === 'NOT_ALLOWED') loadState(false); else render();
+      }
+    });
+  }
+
+  function saveNote(r, text) {
+    call('saveNote', { recordId: r.id, note: text, expectedVersion: r.version }).then(function (res) {
+      if (res.ok) {
+        var rec = res.data.record;
+        S.records = S.records.map(function (x) { return x.id === rec.id ? Object.assign({}, x, rec) : x; });
+        delete S.drafts[r.id];
+        delete S.expanded[r.id];
+        if (res.data.rev === S.rev + 1) S.rev = res.data.rev;
+        render();
+        toast('Note saved.');
+      } else {
+        fail(res);
+        if (res.code === 'CONFLICT' || res.code === 'NOT_FOUND') loadState(false);
+      }
+    });
+  }
+
+  function submitUrlEdit(r, value, confirmed) {
+    var v = String(value).trim();
+    if (!v || v === r.url) { S.editing = ''; renderTable(); return Promise.resolve(); }
+    var payload = { recordId: r.id, url: v, expectedVersion: r.version };
+    if (confirmed) payload.confirm = true;
+    return call('updateUrl', payload).then(function (res) {
+      if (res.ok) {
+        S.editing = '';
+        setState(res.data.state);
+        var rec = S.records.filter(function (x) { return x.id === res.data.focusId; })[0];
+        if (rec && rec.status !== 'VALID') S.focusId = rec.id;
+        renderErrorPanel();
+        return;
+      }
+      if (res.code === 'CONFIRM_REQUIRED') {
+        return confirmDialog('Replace this listing?', res.message, 'Replace listing').then(function (yes) {
+          if (yes) return submitUrlEdit(r, v, true);
+          S.editing = ''; renderTable();
+        });
+      }
+      fail(res);
+      if (res.code === 'CONFLICT' || res.code === 'NOT_FOUND') loadState(false);
+    });
+  }
+
+  function addUrls(lines) {
+    return call('addListings', { urls: lines }).then(function (res) {
+      if (!res.ok) { fail(res); return false; }
+      var results = res.data.results;
+      setState(res.data.state);
+      var bad = results.filter(function (x) { return x.status !== 'VALID'; });
+      var good = results.length - bad.length;
+      if (bad.length) { S.focusId = bad[bad.length - 1].id; renderErrorPanel(); }
+      if (results.length > 1 || (good && !bad.length)) {
+        toast(good + (good === 1 ? ' listing added.' : ' listings added.') + (bad.length ? ' ' + bad.length + ' need attention.' : ''));
+      }
+      return true;
+    });
+  }
+
+  function submitBlank(inp, lines) {
+    if (inp.dataset.busy) return;
+    var clean = lines.map(function (l) { return l.trim(); }).filter(Boolean);
+    if (!clean.length) return;
+    inp.dataset.busy = '1';
+    inp.value = clean[0];
+    inp.disabled = true;
+    addUrls(clean).then(function (ok) { if (!ok) { inp.disabled = false; delete inp.dataset.busy; } });
+  }
+
+  function clearEntry(r) {
+    return call('removeRecord', { recordId: r.id }).then(function (res) {
+      if (res.ok) { S.focusId = ''; setState(res.data.state); toast('Entry cleared.'); }
+      else { fail(res); if (res.code === 'NOT_FOUND') loadState(false); }
+    });
+  }
+
+  function removeListing(r) {
+    return confirmDialog('Remove this listing?', 'Listing ' + r.listingId + ' will be permanently removed, together with its notes and completion status.', 'Remove listing').then(function (yes) {
+      if (!yes) return;
+      return call('removeRecord', { recordId: r.id, confirm: true }).then(function (res) {
+        if (res.ok) { delete S.expanded[r.id]; setState(res.data.state); toast('Listing removed.'); }
+        else { fail(res); if (res.code === 'NOT_FOUND') loadState(false); }
+      });
+    });
+  }
+
+
+  /* ---------------- V5.2: row actions (administrators only) ---------------- */
+  var DLG = { open: false, busy: false, prev: null };
+  var MENU = { node: null, btn: null };
+
+  function actCell(tr, r) {
+    if (!isAdmin()) return;
+    var btn = el('button', {
+      type: 'button', class: 'act-btn', icon: ICON.dots, 'data-actions': r.id,
+      'aria-label': 'Actions for ' + (r.listingId ? 'listing ' + r.listingId : 'this entry'), 'aria-haspopup': 'menu', 'aria-expanded': 'false'
+    });
+    btn.addEventListener('click', function (e) { e.stopPropagation(); openMenu(btn, r); });
+    tr.appendChild(el('td', { class: 'c act-cell' }, [btn]));
+  }
+
+  function closeMenu() {
+    if (MENU.node && MENU.node.parentNode) MENU.node.parentNode.removeChild(MENU.node);
+    if (MENU.btn) MENU.btn.setAttribute('aria-expanded', 'false');
+    MENU.node = null; MENU.btn = null;
+  }
+
+  function openMenu(btn, r) {
+    if (!isAdmin()) return;                       // defence in depth; the server enforces this anyway
+    if (MENU.btn === btn) { closeMenu(); return; }
+    closeMenu();
+    var m = el('div', { class: 'act-menu', role: 'menu', 'aria-label': 'Listing actions' }, [
+      el('button', { type: 'button', role: 'menuitem', class: 'act-item', 'data-act': 'edit-listing', icon: ICON.pencil, onclick: function () { closeMenu(); openEditDialog(r); } }, [el('span', { text: 'Edit Listing' })]),
+      el('button', { type: 'button', role: 'menuitem', class: 'act-item danger', 'data-act': 'delete-listing', icon: ICON.trash, onclick: function () { closeMenu(); openDeleteDialog(r); } }, [el('span', { text: 'Delete Listing' })])
+    ]);
+    document.body.appendChild(m);
+    var rect = btn.getBoundingClientRect();
+    var w = m.offsetWidth || 176, h = m.offsetHeight || 84;
+    var left = Math.max(8, Math.min(rect.right - w, window.innerWidth - w - 8));
+    var top = rect.bottom + 4;
+    if (top + h > window.innerHeight - 8) top = Math.max(8, rect.top - h - 4);
+    m.style.left = left + 'px'; m.style.top = top + 'px';
+    btn.setAttribute('aria-expanded', 'true');
+    MENU.node = m; MENU.btn = btn;
+    MENU.openedAt = Date.now();
+    m.querySelector('.act-item').focus({ preventScroll: true });
+    m.addEventListener('keydown', function (e) {
+      var items = Array.prototype.slice.call(m.querySelectorAll('.act-item'));
+      var i = items.indexOf(document.activeElement);
+      if (e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length].focus(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); items[(i + items.length - 1) % items.length].focus(); }
+      else if (e.key === 'Escape' || e.key === 'Tab') { e.preventDefault(); var b = MENU.btn; closeMenu(); if (b) b.focus(); }
+    });
+  }
+
+  /* ---------------- V5.2: generic dialog ---------------- */
+  function openDialog(title, bodyNodes, actions) {
+    var d = $('dlg');
+    $('dlgTitle').textContent = title;
+    var b = $('dlgBody'); clear(b);
+    bodyNodes.forEach(function (n) { if (n) b.appendChild(n); });
+    var a = $('dlgActions'); clear(a);
+    var btns = {};
+    actions.forEach(function (x) {
+      var btn = el('button', { type: 'button', class: 'btn ' + x.cls, 'data-dlg': x.key, text: x.label });
+      if (x.disabled) btn.disabled = true;
+      btn.addEventListener('click', x.onclick);
+      a.appendChild(btn);
+      btns[x.key] = btn;
+    });
+    if (!DLG.open) DLG.prev = document.activeElement;
+    DLG.open = true; d.hidden = false;
+    return btns;
+  }
+  function closeDialog() {
+    if (DLG.busy) return;
+    $('dlg').hidden = true; DLG.open = false;
+    clear($('dlgBody')); clear($('dlgActions'));
+    if (DLG.prev && DLG.prev.focus) { try { DLG.prev.focus(); } catch (e) { /* row re-rendered */ } }
+    DLG.prev = null;
+  }
+  function setDlgBusy(on, btns, labelKey, busyText, idleText) {
+    DLG.busy = on;
+    Object.keys(btns).forEach(function (k) { btns[k].disabled = on; });
+    if (labelKey && btns[labelKey]) btns[labelKey].textContent = on ? busyText : idleText;
+  }
+  function kvList(pairs) {
+    var dl = el('dl', { class: 'kv' });
+    pairs.forEach(function (p) { dl.appendChild(el('dt', { text: p[0] })); dl.appendChild(el('dd', { text: p[1] })); });
+    return dl;
+  }
+
+  /* ---------------- V5.2: Edit Listing ---------------- */
+  function openEditDialog(r) {
+    if (!isAdmin()) return;
+    var valid = r.status === 'VALID';
+    var urlIn = el('input', { type: 'text', class: 'input', id: 'editUrl', spellcheck: 'false', autocomplete: 'off', maxlength: '2048', 'aria-label': 'Etsy listing URL' });
+    urlIn.value = r.url;
+    var idIn = el('input', { type: 'text', class: 'input readonly', id: 'editId', readonly: true, tabindex: '-1', 'aria-label': 'Listing ID (filled in automatically)' });
+    idIn.value = r.listingId || '';
+    var noteIn = valid ? el('textarea', { class: 'input textarea', id: 'editNote', rows: '4', maxlength: '5000', 'aria-label': 'Notes' }) : null;
+    if (noteIn) noteIn.value = r.notes || '';
+    var err = el('p', { class: 'dlg-err', id: 'editErr', role: 'alert' });
+    var hint = el('p', { class: 'dlg-hint', id: 'editHint' });
+    var btns;
+    var parsed = null;
+
+    function problem() {
+      var v = urlIn.value.trim();
+      parsed = null;
+      if (!v) return 'Enter an Etsy listing link.';
+      parsed = parseEtsy(v);
+      if (!parsed.ok) return 'Please enter a valid Etsy product listing link.';
+      var dup = S.records.filter(function (x) { return x.status === 'VALID' && x.listingId === parsed.listingId && x.id !== r.id; })[0];
+      if (dup) return 'Listing ID ' + parsed.listingId + ' already exists in row ' + dup.n + '. Duplicate listings cannot be saved.';
+      return '';
+    }
+    function refresh() {
+      var msg = problem();
+      idIn.value = parsed && parsed.ok ? parsed.listingId : '';
+      err.textContent = msg;
+      urlIn.classList.toggle('invalid', !!msg);
+      urlIn.setAttribute('aria-invalid', msg ? 'true' : 'false');
+      hint.textContent = (!msg && valid && parsed && parsed.listingId !== r.listingId) ? 'This is a different listing, so you will be asked to confirm the change.' : '';
+      var changed = urlIn.value.trim() !== r.url || (noteIn && noteIn.value !== (r.notes || ''));
+      if (btns && !DLG.busy) btns.save.disabled = !!msg || !changed;
+    }
+    function body() {
+      return [
+        el('label', { class: 'field-label', for: 'editUrl', text: 'Etsy listing URL' }), urlIn,
+        el('label', { class: 'field-label', for: 'editId', text: 'Listing ID (automatic)' }), idIn,
+        noteIn ? el('label', { class: 'field-label', for: 'editNote', text: 'Notes' }) : null, noteIn,
+        err, hint
+      ];
+    }
+    function showEdit() {
+      btns = openDialog('Edit Listing', body(), [
+        { key: 'cancel', label: 'Cancel', cls: 'btn-ghost', onclick: closeDialog },
+        { key: 'save', label: 'Save Changes', cls: 'btn-primary', disabled: true, onclick: function () { onSave(); } }
+      ]);
+      refresh();
+      urlIn.focus();
+    }
+
+    function submit(confirmed, choice) {
+      var payload = { recordId: r.id, url: urlIn.value.trim(), expectedVersion: r.version };
+      if (noteIn && noteIn.value !== (r.notes || '')) payload.note = noteIn.value;
+      if (confirmed) { payload.confirm = true; if (choice) payload.notesChoice = choice; }
+      setDlgBusy(true, btns, 'save', 'Saving…', confirmed ? 'Change Listing' : 'Save Changes');
+      return call('editListing', payload).then(function (res) {
+        setDlgBusy(false, btns, 'save', '', confirmed ? 'Change Listing' : 'Save Changes');
+        if (res.ok) {
+          S.editing = '';
+          setState(res.data.state);
+          closeDialog();
+          toast(res.data.changed === false ? 'No changes to save.' : 'Listing updated.');
+          return;
+        }
+        if (res.code === 'CONFIRM_REQUIRED') { showConfirm(); return; }
+        if (res.code === 'INVALID' || res.code === 'DUPLICATE') { showEdit(); err.textContent = res.message; urlIn.classList.add('invalid'); return; }
+        closeDialog();
+        fail(res);
+        if (res.code === 'CONFLICT' || res.code === 'NOT_FOUND') loadState(false);
+      });
+    }
+    function showConfirm() {
+      var effNotes = noteIn ? noteIn.value : '';
+      var needChoice = valid && effNotes !== '';
+      var keep = el('input', { type: 'radio', name: 'notesChoice', value: 'retain', id: 'nc_retain', checked: true });
+      var drop = el('input', { type: 'radio', name: 'notesChoice', value: 'clear', id: 'nc_clear' });
+      var nodes = [
+        el('p', { class: 'modal-text', text: 'You are changing this listing from ID ' + r.listingId + ' to ID ' + (parsed && parsed.listingId) + '. It will be treated as a different listing:' }),
+        el('ul', { class: 'dlg-list' }, [
+          el('li', { text: 'Images Done will be turned OFF.' }),
+          el('li', { text: 'A new Date Added will be recorded.' }),
+          el('li', { text: 'Date Completed will be cleared.' })
+        ])
+      ];
+      if (needChoice) {
+        nodes.push(el('p', { class: 'field-label', text: 'What should happen to the existing notes?' }));
+        nodes.push(el('label', { class: 'radio', for: 'nc_retain' }, [keep, el('span', { text: 'Keep the notes' })]));
+        nodes.push(el('label', { class: 'radio', for: 'nc_clear' }, [drop, el('span', { text: 'Clear the notes' })]));
+      }
+      btns = openDialog('Change listing identity?', nodes, [
+        { key: 'back', label: 'Back', cls: 'btn-ghost', onclick: function () { showEdit(); } },
+        { key: 'save', label: 'Change Listing', cls: 'btn-primary', onclick: function () { submit(true, needChoice ? (drop.checked ? 'clear' : 'retain') : undefined); } }
+      ]);
+      btns.save.focus();
+    }
+    function onSave() {
+      if (problem()) { refresh(); return; }
+      if (valid && parsed.listingId !== r.listingId) { showConfirm(); return; }
+      submit(false);
+    }
+    urlIn.addEventListener('input', refresh);
+    urlIn.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); if (btns && !btns.save.disabled) onSave(); } });
+    if (noteIn) noteIn.addEventListener('input', refresh);
+    showEdit();
+  }
+
+  /* ---------------- V5.2: Delete Listing ---------------- */
+  function entryState(r) {
+    if (r.status === 'VALID') return r.done ? 'Completed' : 'Remaining';
+    var k = r.error && r.error.kind;
+    return k === 'duplicate' ? 'Duplicate entry' : k === 'orphan' ? 'Original removed' : 'Invalid entry';
+  }
+  function openDeleteDialog(r) {
+    if (!isAdmin()) return;
+    var err = el('p', { class: 'dlg-err', role: 'alert' });
+    var valid = r.status === 'VALID';
+    var btns = openDialog('Delete Listing?', [
+      kvList([['Listing ID', r.listingId || '—'], ['Listing URL', r.url], ['Current state', entryState(r)]]),
+      el('p', { class: 'dlg-warn', text: valid
+        ? 'This listing will be removed from the tracker, together with its notes and completion status. This cannot be undone.'
+        : 'This entry will be removed from the tracker. This cannot be undone.' }),
+      err
+    ], [
+      { key: 'cancel', label: 'Cancel', cls: 'btn-ghost', onclick: closeDialog },
+      { key: 'go', label: 'Delete Listing', cls: 'btn-danger', onclick: function () {
+        if (DLG.busy) return;                      // repeated clicks never send a second request
+        var payload = { recordId: r.id, confirm: true };
+        if (r.listingId) payload.listingId = r.listingId;
+        setDlgBusy(true, btns, 'go', 'Deleting…', 'Delete Listing');
+        call('deleteListing', payload).then(function (res) {
+          setDlgBusy(false, btns, 'go', '', 'Delete Listing');
+          if (res.ok) {                            // success is shown only after the backend confirmed
+            delete S.expanded[r.id]; delete S.drafts[r.id];
+            setState(res.data.state);
+            closeDialog();
+            toast('Listing deleted.');
+            return;
+          }
+          if (res.code === 'NOT_FOUND' || res.code === 'CONFLICT') {
+            closeDialog();
+            toast(res.code === 'NOT_FOUND' ? 'This listing was already deleted.' : res.message, res.code !== 'NOT_FOUND');
+            loadState(false);
+            return;
+          }
+          if (res.code === 'AUTH_REQUIRED' || res.code === 'DENIED') { closeDialog(); fail(res); return; }
+          err.textContent = res.message || 'Could not delete this listing. Nothing was changed.';
+        });
+      } }
+    ]);
+    btns.cancel.focus();
+  }
+
+  /* ---------------- V5.2: Delete Store (Danger Zone) ---------------- */
+  function showNoStores() {
+    S.storeId = ''; S.records = []; S.stores = []; S.filter = 'all'; S.query = ''; recount();
+    var owner = !!(S.caps && S.caps.isOwner);
+    if (!owner) {
+      S.caps = {};
+      showGate('No stores available', 'You do not have access to any store right now. Ask the store owner to add this Google account.', 'denied');
+      return;
+    }
+    S.role = 'admin'; S.caps = { isOwner: true, createStore: true, manageAccess: true };
+    document.body.classList.add('no-store');
+    S.storeName = 'Listing Studio';
+    applyRole();
+    renderHeader(); renderSwitcher(); renderKpis(); renderProgress(); renderTable();
+    ST.tab = 'create';
+    var sp = $('settingsPanel');
+    if (sp.hidden) $('settingsBtn').click();
+    ST.tab = 'create';
+    renderSettings(); showTab('create');
+  }
+
+  function afterStoreDeleted(data) {
+    S.stores = data.stores || [];
+    var msg = data.deleted ? '“' + data.deleted.name + '” was deleted. Its Google Sheet is in Google Drive Trash.' : '';
+    if (data.nextStoreId) {
+      return switchStore(data.nextStoreId).then(function () { if (msg) toast(msg); });
+    }
+    showNoStores();
+    if (msg) toast(msg);
+  }
+
+  function openDeleteStoreDialog() {
+    if (!(S.caps && S.caps.deleteStore)) return;
+    var name = S.storeName;
+    var input = el('input', { type: 'text', class: 'input', id: 'confirmStoreName', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Type the store name to confirm' });
+    var err = el('p', { class: 'dlg-err', role: 'alert' });
+    var c = S.counts || {};
+    var btns = openDialog('Delete Store?', [
+      kvList([
+        ['Store name', name], ['Total listings', String(c.total || 0)], ['Completed', String(c.completed || 0)],
+        ['Remaining', String(c.remaining || 0)], ['Duplicate / invalid', String(c.errors || 0)], ['Authorized people', String(S.memberCount || 0)]
+      ]),
+      el('p', { class: 'dlg-warn', text: 'Deleting this store removes its application workspace and revokes access for everyone who uses it. Its Google Sheet is moved to Google Drive Trash, not permanently deleted, so the store owner can recover it.' }),
+      el('p', { class: 'confirm-name' }, ['Type ', el('b', { text: name }), ' to confirm.']),
+      input, err
+    ], [
+      { key: 'cancel', label: 'Cancel', cls: 'btn-ghost', onclick: closeDialog },
+      { key: 'go', label: 'Delete Store', cls: 'btn-danger', disabled: true, onclick: function () {
+        if (DLG.busy || input.value !== name) return;
+        setDlgBusy(true, btns, 'go', 'Deleting…', 'Delete Store');
+        input.disabled = true;
+        call('deleteStore', { confirmName: input.value, confirm: true }).then(function (res) {
+          input.disabled = false;
+          setDlgBusy(false, btns, 'go', '', 'Delete Store');
+          btns.go.disabled = input.value !== name;
+          if (res.ok) {
+            closeDialog(); closeSettings();
+            afterStoreDeleted(res.data);
+            return;
+          }
+          if (res.code === 'AUTH_REQUIRED') { closeDialog(); fail(res); return; }
+          if (res.code === 'DENIED' || res.code === 'NOT_FOUND') {
+            closeDialog(); toast('This store is no longer available.', true);
+            refreshStores().then(function () { afterStoreDeleted({ stores: S.stores, nextStoreId: (S.stores[0] || {}).id || '' }); });
+            return;
+          }
+          err.textContent = res.message || 'The store could not be deleted. Nothing was changed.';
+        });
+      } }
+    ]);
+    input.addEventListener('input', function () { btns.go.disabled = DLG.busy || input.value !== name; });
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); if (!btns.go.disabled) btns.go.click(); } });
+    input.focus();
+  }
+
+  /* ---------------- admin controls: settings, bulk, timestamps ---------------- */
+  var adminBound = false;
+  var closeSettings = function () {};
+  var SHEET_URL_RE = /^https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+\/edit$/;
+  var ST = { tab: 'store', team: null, create: { reqId: '', failed: false, busy: false, done: null } };
+  function bindAdminControls() {
+    if (adminBound) return;
+    adminBound = true;
+
+    var sp = $('settingsPanel');
+    function openSettings(open) {
+      sp.hidden = !open;
+      $('settingsBtn').setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) {
+        ST.tab = isAdmin() ? 'store' : 'create';
+        if ($('storeNameInput')) {
+          $('storeNameInput').value = S.storeName;
+          if ($('etsyUrlInput')) $('etsyUrlInput').value = S.etsyUrl || '';
+          if ($('etsyUrlError')) $('etsyUrlError').hidden = true;
+          var link = $('sheetLink');
+          var showSheet = !!S.sheetUrl && SHEET_URL_RE.test(S.sheetUrl);
+          $('sheetLinkRow').hidden = !showSheet;
+          if (showSheet) link.setAttribute('href', S.sheetUrl);
+        }
+        renderSettings();
+        if ($('storeNameInput') && ST.tab === 'store') $('storeNameInput').focus();
+      }
+    }
+    closeSettings = function () { if (document.body.classList.contains('no-store')) return; if (!sp.hidden) openSettings(false); };
+    $('settingsBtn').addEventListener('click', function () { if (sp.hidden) openSettings(true); else acGuard(function () { openSettings(false); }); });
+    $('settingsClose').addEventListener('click', function () { acGuard(function () { openSettings(false); }); });
+    $('settingsCancel').addEventListener('click', function () { acGuard(function () { openSettings(false); }); });
+    $('settingsSave').addEventListener('click', function () {
+      var name = $('storeNameInput').value;
+      if (!name.trim()) { toast('Store name cannot be empty.', true); return; }
+      var ee = $('etsyUrlError'); ee.hidden = true;
+      call('saveSettings', { name: name, etsyUrl: $('etsyUrlInput').value }).then(function (res) {
+        if (!res.ok && res.code === 'INVALID' && /etsy|shop|link|listing|url/i.test(res.message || '')) { ee.textContent = res.message; ee.hidden = false; $('etsyUrlInput').focus(); return; }
+        if (res.ok) {
+          S.storeName = res.data.name; S.etsyUrl = res.data.etsyStoreUrl || '';
+          S.stores.forEach(function (x) { if (x.id === S.storeId) x.name = res.data.name; });
+          renderHeader(); renderSwitcher(); openSettings(false); toast('Settings saved.');
+        } else fail(res);
+      });
+    });
+    $('storeNameInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); $('settingsSave').click(); } });
+    $('deleteStoreBtn').addEventListener('click', openDeleteStoreDialog);
+    $('dateFilter').addEventListener('change', function () { S.dateFilter = $('dateFilter').value; renderTable(); });
+    bindTeamControls();
+    bindCreateControls();
+
+    var bp = $('bulkPanel');
+    function openBulk(open) {
+      bp.hidden = !open;
+      $('addBtn').setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) $('bulkText').focus();
+    }
+    $('addBtn').addEventListener('click', function () { openBulk(bp.hidden); });
+    $('bulkClose').addEventListener('click', function () { openBulk(false); });
+    $('bulkCancel').addEventListener('click', function () { openBulk(false); });
+    $('bulkText').addEventListener('input', debounce(analyzeBulk, 120));
+    $('bulkText').addEventListener('paste', function () { setTimeout(analyzeBulk, 0); });
+    $('bulkSubmit').addEventListener('click', function () {
+      var lines = bulkLines();
+      if (!lines.length || lines.length > MAX_BATCH) return;
+      $('bulkSubmit').disabled = true;
+      addUrls(lines).then(function (ok) {
+        if (ok) { $('bulkText').value = ''; analyzeBulk(); openBulk(false); }
+        else analyzeBulk();
+      });
+    });
+
+    $('tsSwitch').addEventListener('click', function () {
+      S.showTs = !S.showTs;
+      $('tsSwitch').setAttribute('aria-checked', S.showTs ? 'true' : 'false');
+      try { localStorage.setItem('ls_show_ts', S.showTs ? '1' : '0'); } catch (e) { /* storage unavailable: fine */ }
+      renderTable();
+    });
+    try { S.showTs = localStorage.getItem('ls_show_ts') === '1'; } catch (e) { S.showTs = false; }
+    $('tsSwitch').setAttribute('aria-checked', S.showTs ? 'true' : 'false');
+
+    $('addRowBtn').addEventListener('click', function () {
+      if (S.filter !== 'all' || S.query) { S.filter = 'all'; S.query = ''; $('search').value = ''; renderKpis(); renderFilters(); }
+      S.extraRows = Math.min(S.extraRows + 1, 25);
+      renderTable();
+      var inputs = document.querySelectorAll('tr.blank input');
+      if (inputs.length) inputs[inputs.length - 1].focus();
+    });
+  }
+
+  /* ---------------- settings sections ---------------- */
+  function availableTabs() {
+    if (!S.storeId) return [['create', 'Create new store']];
+    if (!isAdmin()) return [['create', 'Create new store']];   // team member who may create stores: only that section
+    var t = [['store', 'Store settings']];
+    if (S.caps && S.caps.manageTeam) t.push(['team', 'Manage team']);
+    if (S.caps && S.caps.manageAccess) t.push(['access', 'Manage Users & Access']);
+    if (S.caps && S.caps.createStore) t.push(['create', 'Create new store']);
+    return t;
+  }
+
+  function renderSettings() {
+    var tabs = availableTabs();
+    if (!tabs.some(function (t) { return t[0] === ST.tab; })) ST.tab = tabs[0][0];
+    var bar = $('settingsTabs');
+    clear(bar);
+    bar.hidden = tabs.length < 2;           // a plain administrator sees exactly the original panel
+    $('settingsTitle').textContent = !S.storeId ? 'Create a store' : (tabs.length < 2 ? 'Store settings' : 'Settings');
+    var dz = $('dangerZone'); if (dz) dz.hidden = !(S.storeId && S.caps && S.caps.deleteStore);
+    tabs.forEach(function (t) {
+      bar.appendChild(el('button', {
+        type: 'button', class: 'seg', 'data-tab': t[0], 'aria-pressed': ST.tab === t[0] ? 'true' : 'false', text: t[1],
+        onclick: function () { acGuard(function () { showTab(t[0]); }); }
+      }));
+    });
+    ensureAccessTab();
+    ['store', 'team', 'access', 'create'].forEach(function (k) { var n = $('tab_' + k); if (n) n.hidden = ST.tab !== k; });
+  }
+
+  function showTab(k) {
+    ST.tab = k;
+    renderSettings();
+    if (k === 'team') loadMembers();
+    if (k === 'create') prepareCreate();
+    if (k === 'access') loadAccess();
+    if (k === 'store' && $('storeNameInput')) $('storeNameInput').focus();
+  }
+
+  function copyText(text, input) {
+    function fallback() {
+      try {
+        var t = input || el('textarea', { 'aria-hidden': 'true', style: 'position:fixed;left:-9999px;top:0' });
+        if (!input) { t.value = text; document.body.appendChild(t); }
+        t.focus(); t.select();
+        var okay = document.execCommand && document.execCommand('copy');
+        if (!input) document.body.removeChild(t);
+        return !!okay;
+      } catch (e) { return false; }
+    }
+    function done(okay) { toast(okay ? 'Link copied.' : 'Select the link and press Ctrl+C to copy it.', !okay); }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(fallback()); });
+        return;
+      }
+    } catch (e) { /* use fallback */ }
+    done(fallback());
+  }
+
+  /* ---------------- Manage team ---------------- */
+  var ROLE_LABEL = { admin: 'Administrator', team: 'Team Member' };
+
+  function loadMembers() {
+    $('teamStatus').textContent = 'Loading…';
+    return call('listMembers', {}, true).then(function (r) {
+      if (!r.ok) { $('teamStatus').textContent = r.message || ''; fail(r); return; }
+      ST.team = r.data;
+      renderMembers();
+    });
+  }
+
+  function mutateTeam(action, payload, okMsg) {
+    return call(action, payload).then(function (r) {
+      if (r.ok) { ST.team = r.data; renderMembers(); if (okMsg) toast(okMsg); return true; }
+      fail(r);
+      loadMembers();
+      return false;
+    });
+  }
+
+  function renderMembers() {
+    var v = ST.team;
+    var body = $('teamBody');
+    clear(body);
+    if (!v) return;
+    $('teamStatus').textContent = '';
+    $('teamLink').value = v.appUrl || '';
+    $('teamCount').textContent = v.count + ' of ' + v.limit + ' people on this store. Changes apply immediately, even to people who are signed in right now.';
+    v.members.forEach(function (m) {
+      var tr = el('tr', { class: m.status === 'disabled' ? 'off' : '', 'data-email': m.email });
+      var em = el('td', { class: 'em-cell', 'data-label': 'Google account' }, [el('span', { class: 'em', text: m.email })]);
+      if (m.owner) em.appendChild(el('span', { class: 'chip dark', text: 'OWNER' }));
+      else if (m.manager) em.appendChild(el('span', { class: 'chip', text: 'MANAGES TEAM' }));
+      if (m.you && !m.owner) em.appendChild(el('span', { class: 'chip', text: 'YOU' }));
+      tr.appendChild(em);
+
+      var roleTd = el('td', { 'data-label': 'Role' });
+      if (m.locked) {
+        roleTd.appendChild(document.createTextNode(ROLE_LABEL[m.role]));
+      } else {
+        var sel = el('select', { class: 'input select rolesel', 'aria-label': 'Role for ' + m.email }, [
+          el('option', { value: 'team', text: ROLE_LABEL.team }), el('option', { value: 'admin', text: ROLE_LABEL.admin })
+        ]);
+        sel.value = m.role;
+        sel.addEventListener('change', function () { changeRole(m, sel); });
+        var box = el('div');
+        box.appendChild(sel);
+        if (v.canGrantManager && m.role === 'admin') {
+          var cb = el('input', { type: 'checkbox', 'aria-label': 'Can manage the team: ' + m.email });
+          cb.checked = !!m.manager;
+          cb.addEventListener('change', function () { changeManager(m, cb); });
+          box.appendChild(el('label', { class: 'mgr' }, [cb, el('span', { text: 'Can manage team' })]));
+        }
+        roleTd.appendChild(box);
+      }
+      tr.appendChild(roleTd);
+
+      tr.appendChild(el('td', { 'data-label': 'Status' }, [el('span', { class: 'chip ' + (m.status === 'active' ? 'ok' : 'off'), style: 'margin-left:0', text: m.status === 'active' ? 'Active' : 'Disabled' })]));
+      tr.appendChild(el('td', { 'data-label': 'Date added' }, [el('span', { class: 'ts', text: m.added || '—' })]));
+
+      var act = el('td', { class: 'r', 'data-label': 'Actions' });
+      if (m.locked) {
+        act.appendChild(el('span', { class: 'locked', title: m.why || '', text: m.owner ? 'Locked' : (m.you ? 'This is you' : 'Owner only') }));
+      } else {
+        var wrap = el('div', { class: 'acts' });
+        wrap.appendChild(el('button', {
+          type: 'button', class: 'btn btn-outline btn-sm', 'data-act': m.status === 'active' ? 'disable' : 'restore',
+          text: m.status === 'active' ? 'Disable' : 'Restore', 'aria-label': (m.status === 'active' ? 'Disable access for ' : 'Restore access for ') + m.email,
+          onclick: function () { toggleStatus(m); }
+        }));
+        wrap.appendChild(el('button', {
+          type: 'button', class: 'btn btn-err btn-sm', 'data-act': 'remove', text: 'Remove', 'aria-label': 'Remove ' + m.email + ' from this store',
+          onclick: function () { removeMember(m); }
+        }));
+        act.appendChild(wrap);
+      }
+      tr.appendChild(act);
+      body.appendChild(tr);
+    });
+  }
+
+  function changeRole(m, sel) {
+    var role = sel.value;
+    if (role === m.role) return;
+    var toAdmin = role === 'admin';
+    confirmDialog(
+      toAdmin ? 'Make ' + m.email + ' an administrator?' : 'Change ' + m.email + ' to Team Member?',
+      toAdmin ? 'They will be able to add, edit and remove listings and rename this store.' : 'They will lose administrator rights immediately and can only switch “Images Done”.',
+      toAdmin ? 'Make administrator' : 'Change to Team Member', true
+    ).then(function (yes) {
+      if (!yes) { sel.value = m.role; return; }
+      mutateTeam('setMemberRole', { email: m.email, role: role, confirm: true }, 'Role updated.');
+    });
+  }
+
+  function changeManager(m, cb) {
+    var want = cb.checked;
+    confirmDialog(
+      want ? 'Let ' + m.email + ' manage the team?' : 'Stop ' + m.email + ' managing the team?',
+      want ? 'They will be able to add, disable and remove people on this store, including other administrators.' : 'They will keep administrator rights but can no longer manage people.',
+      want ? 'Allow' : 'Remove permission', true
+    ).then(function (yes) {
+      if (!yes) { cb.checked = !want; return; }
+      mutateTeam('setMemberRole', { email: m.email, role: 'admin', manager: want, confirm: true }, 'Permission updated.');
+    });
+  }
+
+  function toggleStatus(m) {
+    var disabling = m.status === 'active';
+    var payload = { email: m.email, status: disabling ? 'disabled' : 'active' };
+    var go = function (confirmed) {
+      if (confirmed) payload.confirm = true;
+      return mutateTeam('setMemberStatus', payload, disabling ? 'Access disabled.' : 'Access restored.');
+    };
+    if (m.role === 'admin') {
+      return confirmDialog(
+        (disabling ? 'Disable ' : 'Restore ') + m.email + '?',
+        disabling ? 'They are an administrator. They will be blocked immediately, even if signed in now. You can restore access later.' : 'They will be an administrator of this store again.',
+        disabling ? 'Disable access' : 'Restore access', !disabling
+      ).then(function (yes) { if (yes) return go(true); });
+    }
+    return go(false);
+  }
+
+  function removeMember(m) {
+    return confirmDialog(
+      'Remove ' + m.email + '?',
+      'They will lose access to this store immediately, even if they are signed in right now. You can add them again later.',
+      'Remove'
+    ).then(function (yes) {
+      if (yes) return mutateTeam('removeMember', { email: m.email, confirm: true }, 'Person removed.');
+    });
+  }
+
+  function bindTeamControls() {
+    $('teamCopy').addEventListener('click', function () { copyText($('teamLink').value, $('teamLink')); });
+    var form = $('memberForm');
+    function syncMgr() { $('memberMgrRow').hidden = !(ST.team && ST.team.canGrantManager && $('memberRole').value === 'admin'); if ($('memberMgrRow').hidden) $('memberMgr').checked = false; }
+    function openForm(open) {
+      form.hidden = !open;
+      $('addMemberBtn').setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) { $('memberEmail').value = ''; $('memberRole').value = 'team'; syncMgr(); $('memberEmail').focus(); }
+    }
+    $('addMemberBtn').addEventListener('click', function () { openForm(form.hidden); });
+    $('memberCancel').addEventListener('click', function () { openForm(false); });
+    $('memberRole').addEventListener('change', syncMgr);
+    function submit() {
+      var email = $('memberEmail').value.trim();
+      if (!email) { toast('Enter the person’s Google email.', true); $('memberEmail').focus(); return; }
+      var payload = { email: email, role: $('memberRole').value };
+      if ($('memberMgr').checked) payload.manager = true;
+      var go = function () {
+        return mutateTeam('addMember', payload, 'Member added.').then(function (okay) { if (okay) openForm(false); });
+      };
+      if (payload.role === 'admin') {
+        return confirmDialog('Add ' + email + ' as administrator?', 'Administrators can add, edit and remove listings and rename this store.', 'Add administrator', true).then(function (yes) { if (yes) return go(); });
+      }
+      return go();
+    }
+    $('memberAdd').addEventListener('click', submit);
+    $('memberEmail').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+  }
+
+  /* ---------------- Create new store ---------------- */
+  function newRequestId() {
+    var a = new Uint8Array(16);
+    crypto.getRandomValues(a);
+    return Array.prototype.map.call(a, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  }
+  function splitEmails(text) { return String(text || '').split(/[\s,;]+/).filter(Boolean); }
+  var EMAIL_UX_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  function createFeedback(msg, good) {
+    var f = $('createFeedback');
+    f.textContent = msg || '';
+    f.className = 'form-feedback' + (good ? ' good' : '');
+  }
+
+  function resetCreate() {
+    ST.create = { reqId: newRequestId(), failed: false, busy: false, done: null };
+    $('newStoreName').value = ''; $('newStoreAdmins').value = ''; $('newStoreTeam').value = ''; $('newStoreEtsy').value = '';
+    createFeedback('');
+    $('createSubmit').disabled = false; $('createSubmit').textContent = 'Create Store';
+    $('createForm').hidden = false; $('createDone').hidden = true;
+  }
+
+  function prepareCreate() {
+    if (!ST.create.reqId) ST.create.reqId = newRequestId();
+    $('createForm').hidden = !!ST.create.done;
+    $('createDone').hidden = !ST.create.done;
+    var ownerCreates = !!(S.caps && S.caps.isOwner);
+    $('newStoreAdmins').disabled = !ownerCreates; $('newStoreAdminsNote').hidden = ownerCreates;   // only the owner may hand out administrator rights
+    if (!ownerCreates) $('newStoreAdmins').value = '';
+    if (!ST.create.done) $('newStoreName').focus();
+  }
+
+  function refreshStores() {
+    return callGlobal('listMyStores', {}, true).then(function (r) { if (r.ok) { S.stores = r.data.stores; renderSwitcher(); } });
+  }
+
+  function submitCreate() {
+    if (ST.create.busy) return;
+    var name = $('newStoreName').value.trim();
+    var admins = splitEmails($('newStoreAdmins').value);
+    var team = splitEmails($('newStoreTeam').value);
+    if (!name) { createFeedback('Enter a store name.'); $('newStoreName').focus(); return; }
+    var all = admins.concat(team);
+    for (var i = 0; i < all.length; i++) if (!EMAIL_UX_RE.test(all[i])) { createFeedback('“' + all[i] + '” is not a valid email address.'); return; }
+    var lower = {};
+    for (var j = 0; j < admins.length; j++) lower[admins[j].toLowerCase()] = true;
+    for (var k = 0; k < team.length; k++) if (lower[team[k].toLowerCase()]) { createFeedback(team[k] + ' is in both lists. Choose one.'); return; }
+    ST.create.busy = true;
+    $('createSubmit').disabled = true;
+    $('createSubmit').textContent = 'Creating…';
+    createFeedback('Creating the store and its Google Sheet. This takes about 20 seconds. Please keep this page open.', true);
+    var etsy = $('newStoreEtsy').value;
+    callGlobal('createStore', { requestId: ST.create.reqId, name: name, etsyUrl: etsy, admins: admins, team: team }).then(function (r) {
+      ST.create.busy = false;
+      $('createSubmit').disabled = false;
+      $('createSubmit').textContent = 'Create Store';
+      if (r.ok) {
+        ST.create.done = r.data;
+        createFeedback('');
+        renderCreated();
+        refreshStores();
+        toast('Store created.');
+        return;
+      }
+      // Network problems, BUSY and half-finished set-ups keep the SAME request id: pressing the
+      // button again continues the same store and can never create a second one.
+      ST.create.failed = r.code === 'SERVER' || r.code === 'NETWORK' || r.code === 'BUSY';
+      createFeedback(r.message || 'Something went wrong. Please try again.');
+      if (r.code === 'AUTH_REQUIRED' || r.code === 'DENIED') fail(r);
+    });
+  }
+
+  function renderCreated() {
+    var d = ST.create.done;
+    if (!d) return;
+    $('createForm').hidden = true;
+    $('createDone').hidden = false;
+    $('createdName').textContent = d.name;
+    $('createdLink').value = d.appUrl || '';
+    var ok = !!d.sheetUrl && SHEET_URL_RE.test(d.sheetUrl);
+    ['createdSheet', 'createdSheetBtn'].forEach(function (id) {
+      var n = $(id);
+      n.hidden = !ok;
+      if (ok) n.setAttribute('href', d.sheetUrl);
+    });
+    var w = $('createdWarn');
+    clear(w);
+    (d.warnings || []).forEach(function (t) { w.appendChild(el('li', { text: t })); });
+    w.hidden = !(d.warnings || []).length;
+  }
+
+  function bindCreateControls() {
+    $('createSubmit').addEventListener('click', submitCreate);
+    $('createCancel').addEventListener('click', function () { resetCreate(); closeSettings(); });
+    ['newStoreName', 'newStoreEtsy', 'newStoreAdmins', 'newStoreTeam'].forEach(function (id) {
+      $(id).addEventListener('input', function () {
+        createFeedback('');
+        if (ST.create.failed) { ST.create.reqId = newRequestId(); ST.create.failed = false; } // edited form = a new request
+      });
+    });
+    $('createdCopy').addEventListener('click', function () { copyText($('createdLink').value, $('createdLink')); });
+    $('createdOpen').addEventListener('click', function () {
+      var d = ST.create.done;
+      if (!d) return;
+      resetCreate(); closeSettings();
+      switchStore(d.storeId);
+    });
+    $('createdClose').addEventListener('click', function () { var d = ST.create.done; resetCreate(); if (document.body.classList.contains('no-store') && d) { switchStore(d.storeId); return; } closeSettings(); });
+    resetCreate();
+  }
+
+  /* ---------------- store switcher ---------------- */
+  function renderSwitcher() {
+    var wrap = $('switchWrap');
+    var sel = $('storeSwitch');
+    if (!wrap || !sel) return;
+    var list = S.stores || [];
+    wrap.hidden = list.length < 2;       // minimal: only shown to people with more than one store
+    clear(sel);
+    var roles = {}; list.forEach(function (x) { roles[x.role] = true; });
+    var mixed = Object.keys(roles).length > 1;   // only label roles when this person holds different roles in different stores
+    list.forEach(function (x) { sel.appendChild(el('option', { value: x.id, text: x.name + (mixed ? ' — ' + (x.role === 'admin' ? 'Administrator' : 'Team Member') : '') })); });
+    sel.value = S.storeId;
+  }
+
+  function resetStoreView() {
+    S.filter = 'all'; S.query = ''; S.showTsDraft = false; S.dateFilter = 'all'; S.etsyUrl = '';
+    var df = $('dateFilter'); if (df) df.value = 'all';
+    S.expanded = {}; S.drafts = {}; S.pending = {}; S.editing = ''; S.focusId = ''; S.flashId = '';
+    S.extraRows = 2;
+    var q = $('search'); if (q) q.value = '';
+    ST.team = null;
+    closeSettings();
+    var bp = $('bulkPanel'); if (bp) bp.hidden = true;
+    var bt = $('bulkText'); if (bt) bt.value = '';
+  }
+
+  function switchStore(id) {
+    if (!id || id === S.storeId) { renderSwitcher(); return Promise.resolve(); }
+    setSaving(1);
+    return rpc({ action: 'getState', storeId: id, payload: {} }).then(function (r) {
+      setSaving(-1);
+      if (!r.ok) {
+        renderSwitcher();   // snap the selector back to the store that is still open
+        if (r.code === 'AUTH_REQUIRED') { fail(r); return; }
+        toast(r.code === 'DENIED' ? 'You no longer have access to that store.' : (r.message || 'Could not open that store.'), true);
+        refreshStores();
+        return;
+      }
+      document.body.classList.remove('no-store');
+      resetStoreView();
+      S.storeId = id;
+      setState(r.data);
+      toast('Opened ' + r.data.store.name + '.');
+    });
+  }
+
+  function bulkLines() {
+    return $('bulkText').value.split(/\r?\n/).map(function (l) { return l.trim(); }).filter(Boolean);
+  }
+
+  function analyzeBulk() {
+    var box = $('bulkFeedback');
+    if (!box) return;
+    var lines = bulkLines();
+    clear(box);
+    $('bulkSubmit').disabled = !lines.length || lines.length > MAX_BATCH;
+    if (!lines.length) return;
+    var known = {};
+    S.records.forEach(function (r) { if (r.status === 'VALID') known[r.listingId] = r.n; });
+    var seen = {};
+    var nNew = 0, nDup = 0, nBad = 0;
+    var issues = [];
+    lines.forEach(function (l, i) {
+      var p = parseEtsy(l);
+      if (!p.ok) { nBad++; issues.push('Line ' + (i + 1) + ': not a valid Etsy product listing link'); return; }
+      if (known[p.listingId]) { nDup++; issues.push('Line ' + (i + 1) + ': duplicate — ID ' + p.listingId + ' already exists in row ' + known[p.listingId]); return; }
+      if (seen[p.listingId]) { nDup++; issues.push('Line ' + (i + 1) + ': duplicate of line ' + seen[p.listingId] + ' in this paste'); return; }
+      seen[p.listingId] = i + 1;
+      nNew++;
+    });
+    var sum = nNew + ' new · ' + nDup + ' duplicate · ' + nBad + ' invalid';
+    box.appendChild(el('span', { class: 'sum', text: lines.length > MAX_BATCH ? 'Too many links (max ' + MAX_BATCH + ' at a time).' : sum }));
+    if (issues.length) {
+      var ul = el('ul');
+      issues.slice(0, 20).forEach(function (t) { ul.appendChild(el('li', { text: t })); });
+      if (issues.length > 20) ul.appendChild(el('li', { text: '…and ' + (issues.length - 20) + ' more' }));
+      box.appendChild(ul);
+    }
+  }
+
+  /* ---------------- polling (periodic, NOT real-time) ---------------- */
+  function poll() {
+    if (document.hidden || S.inflight > 0 || Object.keys(S.pending).length || !firstLoaded || !S.storeId || DLG.open) return;
+    call('getRevision', {}, true).then(function (r) {
+      if (!r.ok) { if (r.code === 'AUTH_REQUIRED' || r.code === 'DENIED') fail(r); return; }
+      if (r.data.name && r.data.name !== S.storeName) { S.storeName = r.data.name; renderHeader(); }
+      if (r.data.rev === S.rev) return;
+      var a = document.activeElement;
+      if (a && a.closest && a.closest('#tbody') && (a.tagName === 'TEXTAREA' || a.tagName === 'INPUT')) return; // never clobber typing; next tick retries
+      loadState(false);
+    });
+  }
+
+  /* ---------------- V5.3: revocation while a store is open ---------------- */
+  function handleRevoked(r) {
+    if (!firstLoaded || !S.storeId) { showGate('Access denied', (r && r.message) || 'You do not have access to this store.', 'denied'); return; }
+    var lostName = S.storeName, lostId = S.storeId;
+    // Clear the restricted workspace from the interface first, then move to a store this person may still open.
+    S.records = []; S.etsyUrl = ''; S.sheetUrl = ''; S.expanded = {}; S.drafts = {}; S.pending = {}; S.query = ''; S.filter = 'all'; S.dateFilter = 'all';
+    recount(); try { openSettings(false); } catch (e) {} render();
+    callGlobal('listMyStores', {}, true).then(function (lr) {
+      var list = (lr.ok ? lr.data.stores : []).filter(function (x) { return x.id !== lostId; });
+      if (!list.length) { showGate('Access denied', 'You do not currently have access to any stores. Please contact your administrator.', 'denied'); return; }
+      S.stores = list; S.storeId = '';
+      switchStore(list[0].id).then(function () { toast('You no longer have access to “' + lostName + '”.', true); });
+    });
+  }
+
+  /* ---------------- V5.3: Manage Users & Access (owner only; built on demand, never in other users' DOM) ---------------- */
+  var AC = { data: null, mode: 'list', q: '', f: 'all', sq: '', edit: null, busy: false, loading: false };
+  var AC_ICON = {
+    shield: svg('<path d="M12 3 4 6v6c0 4.5 3.2 7.8 8 9 4.8-1.2 8-4.5 8-9V6l-8-3Z"/><path d="m8.5 12 2.5 2.5 4.5-5"/>', 22, 1.75),
+    store: svg('<path d="M4 9.5 5.5 4h13L20 9.5"/><path d="M4 9.5a2.5 2.5 0 0 0 5 0 2.5 2.5 0 0 0 6 0 2.5 2.5 0 0 0 5 0"/><path d="M5 12v8h14v-8"/><path d="M10 20v-5h4v5"/>', 16),
+    lock: svg('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>', 13, 2),
+    plus: svg('<path d="M12 5v14M5 12h14"/>', 14, 2.25)
+  };
+  var EMAIL_RE_UX = /^[^\s@<>()",;:\\]+@[^\s@<>()",;:\\]+\.[^\s@<>()",;:\\]{2,}$/;
+
+  function ensureAccessTab() {
+    var want = !!(S.caps && S.caps.manageAccess) && isAdmin();
+    var node = $('tab_access');
+    if (want && !node) {
+      node = el('div', { id: 'tab_access', class: 'stab', hidden: true });
+      var anchor = $('tab_create') || $('tab_team');
+      anchor.parentNode.insertBefore(node, anchor);
+    } else if (!want && node) {
+      node.parentNode.removeChild(node); AC.data = null; AC.edit = null; AC.mode = 'list';
+    }
+  }
+
+  function acRoleLabel(summary) { return { owner: 'Owner', admin: 'Administrator', team: 'Team Member', mixed: 'Mixed Roles', none: 'No stores' }[summary] || ''; }
+  function acStoreName(id) { var s = (AC.data ? AC.data.stores : []).filter(function (x) { return x.id === id; })[0]; return s ? s.name : 'Unknown store'; }
+  function acDirty() {
+    var E = AC.edit;
+    if (AC.mode !== 'edit' || !E) return false;
+    if (E.isNew && E.email.trim()) return true;
+    if (E.canCreate !== E.base.canCreate || E.disabled !== E.base.disabled) return true;
+    return Object.keys(E.draft).some(function (id) { return (E.base.assignments[id] || 'none') !== E.draft[id]; });
+  }
+  /** Runs `go` now, or after the owner confirms discarding unsaved access changes. */
+  function acGuard(go) {
+    if (!acDirty()) { go(); return; }
+    var btns = openDialog('Discard unsaved changes?', [el('p', { class: 'dlg-hint', text: 'You have unsaved access changes for ' + (AC.edit.email || 'this user') + '. If you leave now they will be lost.' })], [
+      { key: 'keep', cls: 'btn-outline', label: 'Keep Editing', onclick: function () { closeDialog(); } },
+      { key: 'discard', cls: 'btn-danger', label: 'Discard Changes', onclick: function () { closeDialog(); AC.mode = 'list'; AC.edit = null; go(); } }
+    ]);
+    btns.keep.focus();
+  }
+
+  function loadAccess() {
+    var box = $('tab_access'); if (!box) return;
+    AC.loading = true;
+    if (!AC.data) { clear(box); box.appendChild(el('p', { class: 'helper', text: 'Loading users…' })); }
+    return callGlobal('listAccess', {}, true).then(function (r) {
+      AC.loading = false;
+      if (!r.ok) { clear(box); box.appendChild(el('p', { class: 'form-feedback', text: r.message || 'Could not load users.' })); return; }
+      AC.data = r.data; renderAccess();
+    });
+  }
+
+  function acSwitch(on, label, disabled, onchange) {
+    var b = el('button', { type: 'button', class: 'switch switch-sm', role: 'switch', 'aria-checked': on ? 'true' : 'false', 'aria-label': label, disabled: disabled ? true : null }, [el('span', { class: 'knob' })]);
+    b.addEventListener('click', function () { if (b.disabled) return; onchange(b.getAttribute('aria-checked') !== 'true'); });
+    return b;
+  }
+
+  function renderAccess() {
+    var box = $('tab_access'); if (!box || !AC.data) return;
+    clear(box);
+    box.appendChild(AC.mode === 'edit' ? acEditView() : acListView());
+  }
+
+  function acHeader(extra) {
+    var D = AC.data;
+    return el('div', { class: 'ac-head' }, [
+      el('span', { class: 'ac-shield', icon: AC_ICON.shield }),
+      el('div', { class: 'ac-titles' }, [
+        el('h3', { class: 'ac-title', text: 'Manage Users & Access' }),
+        el('p', { class: 'helper ac-sub', text: 'Manage users across all stores.' })
+      ]),
+      extra || null
+    ]);
+  }
+
+  function acListView() {
+    var D = AC.data, wrap = el('div', { class: 'ac', 'data-view': 'list' });
+    var addBtn = el('button', { type: 'button', id: 'acAdd', class: 'btn btn-primary', icon: AC_ICON.plus }, [' Add User']);
+    addBtn.addEventListener('click', function () { acOpen(null); });
+    wrap.appendChild(acHeader(addBtn));
+    wrap.appendChild(el('div', { class: 'ac-counters', 'aria-label': 'Summary' }, [
+      el('span', { class: 'ac-chip' }, [el('b', { id: 'acStoreCount', text: String(D.storeCount) }), ' stores']),
+      el('span', { class: 'ac-chip' }, [el('b', { id: 'acUserCount', text: String(D.userCount) }), ' users']),
+      el('span', { class: 'ac-chip' }, ['Owner: ', el('b', { text: D.owner }) ])
+    ]));
+    var q = el('input', { id: 'acSearch', class: 'input', type: 'search', placeholder: 'Search by email…', autocomplete: 'off', 'aria-label': 'Search users by email', value: AC.q });
+    var f = el('select', { id: 'acFilter', class: 'input select', 'aria-label': 'Filter users' });
+    [['all', 'All users'], ['admin', 'Administrators'], ['team', 'Team members'], ['mixed', 'Mixed roles'], ['disabled', 'Disabled']].forEach(function (o) { f.appendChild(el('option', { value: o[0], text: o[1] })); });
+    f.value = AC.f;
+    wrap.appendChild(el('div', { class: 'ac-tools' }, [q, f]));
+    var body = el('div', { class: 'ac-list', id: 'acList' });
+    wrap.appendChild(body);
+    function fill() {
+      clear(body);
+      var needle = AC.q.trim().toLowerCase();
+      var rows = D.users.filter(function (u) {
+        if (needle && u.email.indexOf(needle) === -1) return false;
+        if (AC.f === 'admin' || AC.f === 'team' || AC.f === 'mixed') return u.summary === AC.f;
+        if (AC.f === 'disabled') return u.disabled;
+        return true;
+      });
+      if (!rows.length) { body.appendChild(el('p', { class: 'helper', id: 'acEmpty', text: needle || AC.f !== 'all' ? 'No users match.' : 'No users yet. Use Add User.' })); return; }
+      rows.forEach(function (u) {
+        var row = el('div', { class: 'ac-user' + (u.owner ? ' owner' : '') + (u.disabled ? ' disabled' : ''), 'data-email': u.email });
+        row.appendChild(el('div', { class: 'ac-email', text: u.email }));
+        row.appendChild(el('div', { class: 'ac-meta' }, [
+          el('span', { class: 'ac-badge b-' + u.summary, text: acRoleLabel(u.summary) }),
+          el('span', { class: 'ac-count', text: u.owner ? 'All ' + u.storeCount + ' stores' : u.storeCount + (u.storeCount === 1 ? ' store' : ' stores') }),
+          el('span', { class: 'ac-status' + (u.disabled ? ' off' : ''), text: u.owner ? 'Protected' : (u.disabled ? 'Disabled' : 'Active') })
+        ]));
+        if (u.owner) row.appendChild(el('span', { class: 'ac-lock', icon: AC_ICON.lock }, [' Owner']));
+        else {
+          var b = el('button', { type: 'button', class: 'btn btn-outline btn-sm', 'data-manage': u.email, text: 'Manage Access' });
+          b.addEventListener('click', function () { acOpen(u.email); });
+          row.appendChild(b);
+        }
+        body.appendChild(row);
+      });
+    }
+    q.addEventListener('input', function () { AC.q = q.value; fill(); });
+    f.addEventListener('change', function () { AC.f = f.value; fill(); });
+    fill();
+    return wrap;
+  }
+
+  /** Opens the editor for an existing user (email) or a brand-new one (null). */
+  function acOpen(email) {
+    var D = AC.data, u = email ? D.users.filter(function (x) { return x.email === email; })[0] : null;
+    var base = { assignments: u ? JSON.parse(JSON.stringify(u.stores)) : {}, canCreate: u ? u.canCreate : false, disabled: u ? u.disabled : false };
+    var draft = {};
+    D.stores.forEach(function (s) { draft[s.id] = base.assignments[s.id] || 'none'; });
+    AC.edit = { email: email || '', isNew: !email, base: base, draft: draft, canCreate: base.canCreate, disabled: base.disabled, defaultRole: 'team', error: '' };
+    AC.mode = 'edit'; AC.sq = ''; renderAccess();
+    var first = $(email ? 'acSave' : 'acEmail'); if (first) first.focus();
+  }
+
+  function acDraftCounts() {
+    var E = AC.edit, a = 0, t = 0;
+    Object.keys(E.draft).forEach(function (id) { if (E.draft[id] === 'admin') a++; else if (E.draft[id] === 'team') t++; });
+    return { admin: a, team: t, on: a + t, total: AC.data.stores.length };
+  }
+
+  function acEditView() {
+    var D = AC.data, E = AC.edit, wrap = el('div', { class: 'ac', 'data-view': 'edit' });
+    wrap.appendChild(acHeader(null));
+    var back = el('button', { type: 'button', class: 'linklike ac-back', id: 'acBack', text: '← All users' });
+    back.addEventListener('click', function () { acGuard(function () { AC.mode = 'list'; AC.edit = null; renderAccess(); }); });
+    wrap.appendChild(back);
+
+    // identity
+    var idRow = el('div', { class: 'ac-id' });
+    if (E.isNew) {
+      var em = el('input', { id: 'acEmail', class: 'input', type: 'text', inputmode: 'email', autocomplete: 'off', spellcheck: 'false', maxlength: '254', placeholder: 'name@gmail.com', value: E.email, 'aria-label': 'Google account email' });
+      em.addEventListener('input', function () { E.email = em.value; E.error = ''; acRefresh(); });
+      idRow.appendChild(el('label', { class: 'field-label', for: 'acEmail', text: 'Google account email' }));
+      idRow.appendChild(em);
+    } else {
+      idRow.appendChild(el('div', { class: 'field-label', text: 'Google account' }));
+      idRow.appendChild(el('div', { class: 'ac-email-big', id: 'acEmailText', text: E.email }));
+    }
+    var dr = el('select', { id: 'acDefaultRole', class: 'input select', 'aria-label': 'Default role for newly selected stores' });
+    [['team', 'Team Member'], ['admin', 'Administrator']].forEach(function (o) { dr.appendChild(el('option', { value: o[0], text: o[1] })); });
+    dr.value = E.defaultRole; dr.addEventListener('change', function () { E.defaultRole = dr.value; });
+    idRow.appendChild(el('label', { class: 'field-label top-gap', for: 'acDefaultRole', text: 'Default role for newly selected stores' }));
+    idRow.appendChild(dr);
+    wrap.appendChild(idRow);
+
+    // live summary + bulk controls + store search
+    var sum = el('p', { class: 'ac-summary', id: 'acSummary', role: 'status', 'aria-live': 'polite' });
+    var sel = el('button', { type: 'button', class: 'btn btn-outline btn-sm', id: 'acSelectAll', text: 'Select All' });
+    var desel = el('button', { type: 'button', class: 'btn btn-outline btn-sm', id: 'acDeselectAll', text: 'Deselect All' });
+    sel.addEventListener('click', function () { D.stores.forEach(function (s) { if (E.draft[s.id] === 'none') E.draft[s.id] = E.defaultRole; }); acRefresh(true); });
+    desel.addEventListener('click', function () { D.stores.forEach(function (s) { E.draft[s.id] = 'none'; }); acRefresh(true); });
+    var sq = el('input', { id: 'acStoreSearch', class: 'input', type: 'search', placeholder: 'Search stores…', autocomplete: 'off', 'aria-label': 'Search stores', value: AC.sq });
+    sq.addEventListener('input', function () { AC.sq = sq.value; acFillStores(); });
+    wrap.appendChild(el('div', { class: 'ac-bar' }, [sum, el('div', { class: 'ac-bulk' }, [sel, desel])]));
+    wrap.appendChild(sq);
+    wrap.appendChild(el('div', { class: 'ac-stores', id: 'acStores' }));
+
+    // account switches (existing users)
+    var acct = el('div', { class: 'ac-acct', id: 'acAcct' });
+    wrap.appendChild(acct);
+    wrap.appendChild(el('p', { class: 'form-feedback', id: 'acError', role: 'alert', hidden: true }));
+    var save = el('button', { type: 'button', class: 'btn btn-primary', id: 'acSave', text: 'Save Access Permissions' });
+    var cancel = el('button', { type: 'button', class: 'btn btn-ghost', id: 'acCancel', text: 'Cancel' });
+    save.addEventListener('click', acSave);
+    cancel.addEventListener('click', function () { acGuard(function () { AC.mode = 'list'; AC.edit = null; renderAccess(); }); });
+    wrap.appendChild(el('div', { class: 'panel-actions' }, [save, cancel, el('span', { class: 'ac-dirty', id: 'acDirty', hidden: true, text: 'Unsaved changes' })]));
+    setTimeout(function () { acRefresh(); }, 0);
+    return wrap;
+  }
+
+  function acFillStores() {
+    var D = AC.data, E = AC.edit, box = $('acStores'); if (!box || !E) return;
+    clear(box);
+    var needle = AC.sq.trim().toLowerCase();
+    var shown = D.stores.filter(function (s) { return !needle || s.name.toLowerCase().indexOf(needle) !== -1; });
+    if (!shown.length) box.appendChild(el('p', { class: 'helper', text: D.stores.length ? 'No stores match.' : 'There are no stores yet.' }));
+    shown.forEach(function (s) {
+      var role = E.draft[s.id];
+      var was = E.base.assignments[s.id] || 'none';
+      var row = el('div', { class: 'ac-store r-' + role + (role !== was ? ' changed' : ''), 'data-store': s.id });
+      row.appendChild(el('span', { class: 'ac-store-icon', icon: AC_ICON.store }));
+      row.appendChild(el('span', { class: 'ac-store-name', text: s.name }));
+      var sw = acSwitch(role !== 'none', 'Access to ' + s.name, false, function (on) { E.draft[s.id] = on ? E.defaultRole : 'none'; acRefresh(true); });
+      var rs = el('select', { class: 'input select ac-role', 'aria-label': 'Role in ' + s.name, 'data-role': s.id });
+      [['team', 'Team Member'], ['admin', 'Administrator']].forEach(function (o) { rs.appendChild(el('option', { value: o[0], text: o[1] })); });
+      if (role === 'none') rs.hidden = true; else rs.value = role;
+      rs.addEventListener('change', function () { E.draft[s.id] = rs.value; acRefresh(true); });
+      row.appendChild(sw); row.appendChild(rs);
+      row.appendChild(el('span', { class: 'ac-state', text: role === 'admin' ? 'Administrator' : role === 'team' ? 'Team Member' : 'No Access' }));
+      box.appendChild(row);
+    });
+  }
+
+  /** Re-renders the parts that depend on the draft (counts, rows, account switches, save button). */
+  function acRefresh(rows) {
+    var E = AC.edit; if (!E || AC.mode !== 'edit') return;
+    var c = acDraftCounts();
+    if (E.canCreate && c.admin === 0) E.canCreate = false;     // creation right needs at least one Administrator assignment
+    var sum = $('acSummary');
+    if (sum) sum.textContent = c.on + ' of ' + c.total + ' stores selected · ' + c.admin + ' Administrator, ' + c.team + ' Team Member';
+    if (rows || !$('acStores').firstChild) acFillStores();
+    var a = $('acAcct');
+    if (a) {
+      clear(a);
+      var mk = function (id, title, desc, on, dis, fn) {
+        var r = el('div', { class: 'ac-switchrow', id: id }, [el('div', {}, [el('div', { class: 'ac-switch-title', text: title }), el('div', { class: 'helper tight', text: desc })]), acSwitch(on, title, dis, fn)]);
+        a.appendChild(r);
+      };
+      mk('acCreateRow', 'Allow New Store Creation', c.admin === 0 ? 'Needs Administrator access to at least one store.' : 'This person may create new stores and becomes their Administrator.', E.canCreate, c.admin === 0 || E.disabled, function (on) { E.canCreate = on; acRefresh(); });
+      if (!E.isNew) mk('acEnabledRow', 'Account access', E.disabled ? 'Disabled: this person is denied in every store. Their assignments are kept.' : 'Enabled', !E.disabled, false, function (on) { E.disabled = !on; if (E.disabled) E.canCreate = false; acRefresh(); });
+    }
+    var dirty = acDirty(), ok = !E.isNew || EMAIL_RE_UX.test(E.email.trim());
+    var save = $('acSave'); if (save) save.disabled = !dirty || !ok;
+    var dd = $('acDirty'); if (dd) dd.hidden = !dirty;
+  }
+
+  function acDiff() {
+    var E = AC.edit, g = [], rv = [], ch = [], adminGrant = 0, adminLoss = 0;
+    Object.keys(E.draft).forEach(function (id) {
+      var from = E.base.assignments[id] || 'none', to = E.draft[id];
+      if (from === to) return;
+      if (from === 'none') { g.push([id, to]); if (to === 'admin') adminGrant++; }
+      else if (to === 'none') { rv.push([id, from]); if (from === 'admin') adminLoss++; }
+      else { ch.push([id, from, to]); if (to === 'admin') adminGrant++; else adminLoss++; }
+    });
+    return { grants: g, revokes: rv, changes: ch, adminGrant: adminGrant, adminLoss: adminLoss,
+      create: E.canCreate !== E.base.canCreate, disabled: E.disabled !== E.base.disabled };
+  }
+
+  function acSave() {
+    var E = AC.edit; if (!E || AC.busy) return;
+    var email = E.email.trim().toLowerCase();
+    var err = $('acError'); err.hidden = true;
+    if (E.isNew) {
+      if (!EMAIL_RE_UX.test(email)) { err.textContent = 'Enter a valid Google email address.'; err.hidden = false; return; }
+      var dup = AC.data.users.filter(function (u) { return u.email === email; })[0];
+      if (dup) {
+        err.textContent = email + ' already exists. ';
+        var use = el('button', { type: 'button', class: 'linklike', id: 'acUseExisting', text: 'Manage their access instead' });
+        use.addEventListener('click', function () { E.isNew = false; E.email = ''; acOpen(email); });
+        err.appendChild(use); err.hidden = false; return;
+      }
+    }
+    var d = acDiff();
+    var significant = d.adminGrant > 0 || d.revokes.length > 0 || d.adminLoss > 0 || (d.create && E.canCreate) || (d.disabled && E.disabled);
+    if (!significant) { acCommit(false); return; }
+    var items = [];
+    function list(title, arr, fmt) { if (!arr.length) return; items.push(el('div', { class: 'dlg-sec' }, [el('b', { text: title }), el('ul', { class: 'dlg-list' }, arr.map(function (x) { return el('li', { text: fmt(x) }); }))])); }
+    list('Newly granted access (' + d.grants.length + ')', d.grants, function (x) { return acStoreName(x[0]) + ' — ' + (x[1] === 'admin' ? 'Administrator' : 'Team Member'); });
+    list('Access removed (' + d.revokes.length + ')', d.revokes, function (x) { return acStoreName(x[0]); });
+    list('Role changes (' + d.changes.length + ')', d.changes, function (x) { return acStoreName(x[0]) + ': ' + (x[1] === 'admin' ? 'Administrator' : 'Team Member') + ' → ' + (x[2] === 'admin' ? 'Administrator' : 'Team Member'); });
+    var other = [];
+    if (d.create) other.push('Store creation: ' + (E.canCreate ? 'allowed' : 'not allowed'));
+    if (d.disabled) other.push('Account: ' + (E.disabled ? 'will be disabled in every store' : 'will be restored'));
+    list('Account', other, function (x) { return x; });
+    var msg = 'You are changing access for ' + email + ': ' + d.grants.length + ' granted, ' + d.revokes.length + ' removed, ' + d.changes.length + ' role changes.';
+    var btns = openDialog('Confirm access changes', [el('p', { class: 'dlg-hint', text: msg })].concat(items), [
+      { key: 'cancel', cls: 'btn-outline', label: 'Cancel', onclick: function () { closeDialog(); } },
+      { key: 'go', cls: 'btn-primary', label: 'Confirm and Save', onclick: function () { closeDialog(); acCommit(true); } }
+    ]);
+    btns.cancel.focus();
+  }
+
+  function acCommit(confirm) {
+    var E = AC.edit; if (!E || AC.busy) return;
+    AC.busy = true; $('acSave').disabled = true; $('acSave').textContent = 'Saving…';
+    var email = E.email.trim().toLowerCase();
+    callGlobal('saveUserAccess', { email: email, isNew: E.isNew, assignments: E.draft, base: E.base, canCreate: E.canCreate, disabled: E.disabled, confirm: confirm }).then(function (r) {
+      AC.busy = false;
+      var sv = $('acSave'); if (sv) { sv.textContent = 'Save Access Permissions'; }
+      if (r.ok) {                                   // success is shown ONLY now that the server confirmed it
+        AC.data = r.data.access; AC.mode = 'list'; AC.edit = null; renderAccess();
+        toast(r.data.changed ? 'Access saved for ' + email + '.' : 'No changes to save.');
+        refreshStores();
+        return;
+      }
+      if (r.code === 'AUTH_REQUIRED') { fail(r); return; }
+      if (r.code === 'CONFLICT') {
+        callGlobal('listAccess', {}, true).then(function (lr) { if (lr.ok) { AC.data = lr.data; acOpen(E.isNew ? null : email); toast(r.message, true); } });
+        return;
+      }
+      var er = $('acError'); if (er) { er.textContent = r.message || 'The change could not be saved.'; er.hidden = false; }
+      acRefresh();
+    });
+  }
+
+  /* ---------------- boot ---------------- */
+  function init() {
+    $('search').addEventListener('input', debounce(function () { S.query = $('search').value; renderTable(); }, 120));
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
+    setInterval(poll, POLL_MS);
+
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && DLG.open && !DLG.busy) { e.preventDefault(); closeDialog(); } });
+    document.addEventListener('click', function (e) { if (MENU.node && !MENU.node.contains(e.target)) closeMenu(); });
+    window.addEventListener('resize', closeMenu);
+    window.addEventListener('scroll', function (e) { if (MENU.node && Date.now() - (MENU.openedAt || 0) > 250 && !(e.target && e.target.nodeType === 1 && MENU.node.contains(e.target))) closeMenu(); }, true);
+    $('gateLink').addEventListener('click', beginLogin);
+    $('gateRetry').addEventListener('click', tryAgain);
+    $('gateSignOut').addEventListener('click', signOut);
+    $('storeSwitch').addEventListener('change', function () { var to = $('storeSwitch').value; if (acDirty()) { renderSwitcher(); acGuard(function () { switchStore(to); }); return; } switchStore(to); });
+    window.addEventListener('beforeunload', function (e) { if (acDirty()) { e.preventDefault(); e.returnValue = ''; } });
+    var key = 'ls_tok_' + BOOT.storeId;
+    try { S.token = sessionStorage.getItem(key) || ''; } catch (e) { S.token = ''; }
+
+    if (!BOOT.storeId) {
+      showGate('Missing store link', 'Please open the link the store owner sent you. It ends with ?store=\u2026');
+      return;
+    }
+    if (BOOT.pending) { redeemPending(); return; }
+    if (BOOT.authMode === 'SESSION' && !S.token) { gateSignIn(); return; }
+    loadState(true);
+  }
+
+  window.__LS = { S: S, render: render, poll: poll };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+</script>
